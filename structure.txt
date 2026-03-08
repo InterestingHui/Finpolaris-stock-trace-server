@@ -1,0 +1,7 @@
+stock-trace/
+├── app.py                  # Flask后端主程序
+├── templates/
+│   └── index.html          # 前端页面
+├── static/                 # (可选) 存放CSS/JS，此处直接内嵌到HTML
+├── requirements.txt        # Python依赖
+└── db.sql                  # 数据库初始化脚本
