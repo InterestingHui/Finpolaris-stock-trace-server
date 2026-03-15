@@ -1,21 +1,18 @@
-# app.py
 import os
-import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import pymysql
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import tushare as ts
 
 app = Flask(__name__)
-CORS(app)  # 允许跨域请求
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ================== 配置 ==================
-TUSHARE_TOKEN = 'de81b74f57902d498037a789ac0f31b5e485df1bff7f0bfe211e8a41'  # 请替换为真实token
+# ========== 配置 ==========
+TUSHARE_TOKEN = 'de81b74f57902d498037a789ac0f31b5e485df1bff7f0bfe211e8a41'  # 请替换
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 
-# 数据库连接配置
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
@@ -25,250 +22,467 @@ DB_CONFIG = {
     'cursorclass': pymysql.cursors.DictCursor
 }
 
-def get_db_connection():
+def get_db():
     return pymysql.connect(**DB_CONFIG)
 
-# ================== 工具函数 ==================
-def get_price_from_tushare(stock_code, date, price_type):
+# ========== 工具函数 ==========
+def get_price_from_tushare(stock_code, trade_date, price_type='open'):
     """
-    获取指定股票在指定日期的价格
+    获取指定股票在指定日期的开盘价或收盘价
     :param stock_code: e.g. '000001.SZ'
-    :param date: 字符串 'YYYYMMDD'
+    :param trade_date: 日期字符串 'YYYYMMDD' 或 date对象
     :param price_type: 'open' 或 'close'
-    :return: float 价格, 或 None 如果获取失败
+    :return: float 价格，或 None
     """
+    if isinstance(trade_date, date):
+        trade_date = trade_date.strftime('%Y%m%d')
     try:
-        df = pro.daily(ts_code=stock_code, start_date=date, end_date=date)
+        df = pro.daily(ts_code=stock_code, start_date=trade_date, end_date=trade_date)
         if df.empty:
             # 尝试获取前一个交易日的数据
-            df = pro.daily(ts_code=stock_code, start_date=(datetime.strptime(date, '%Y%m%d') - timedelta(days=10)).strftime('%Y%m%d'), end_date=date)
+            prev_date = (datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=10)).strftime('%Y%m%d')
+            df = pro.daily(ts_code=stock_code, start_date=prev_date, end_date=trade_date)
             if df.empty:
                 return None
-            df = df[df['trade_date'] <= date].head(1)  # 取最近的一条
+            df = df[df['trade_date'] <= trade_date].head(1)
         price = float(df.iloc[0][price_type])
         return price
     except Exception as e:
         print(f"tushare error: {e}")
         return None
 
-def get_latest_price(stock_code):
-    """
-    获取最新交易日收盘价
-    """
+def get_latest_price(stock_code, price_type='close'):
+    """获取最新交易日价格"""
     try:
         df = pro.daily(ts_code=stock_code, limit=1)
         if not df.empty:
-            return float(df.iloc[0]['close'])
+            return float(df.iloc[0][price_type])
     except Exception as e:
         print(f"get_latest_price error: {e}")
     return None
 
-def update_position_after_trade(stock_code, action, quantity, trade_price, signal_id=None):
+def calculate_strategy_cash_and_positions(strategy_id):
     """
-    根据交易更新positions表，并记录快照
+    计算策略当前现金余额和持仓（净数量）
+    返回: (cash, positions_dict)
+    positions_dict: {stock_code: net_quantity}
     """
-    conn = get_db_connection()
+    conn = get_db()
     try:
         with conn.cursor() as cursor:
-            # 查询当前持仓
-            cursor.execute("SELECT * FROM positions WHERE stock_code = %s", (stock_code,))
-            pos = cursor.fetchone()
+            # 获取初始资金
+            cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None, None
+            initial_capital = float(row['initial_capital'])  # <--- 转为 float
 
-            old_quantity = pos['quantity'] if pos else 0
-            old_avg_cost = pos['avg_cost'] if pos else 0
-
-            if action == 'buy':
-                new_quantity = old_quantity + quantity
-                # 计算新的加权平均成本
-                new_avg_cost = (old_avg_cost * old_quantity + trade_price * quantity) / new_quantity if new_quantity > 0 else 0
-                new_price = trade_price  # 买入后最新价暂时用成交价
-            else:  # sell
-                if old_quantity < quantity:
-                    raise ValueError("卖出数量超过持仓")
-                new_quantity = old_quantity - quantity
-                new_avg_cost = old_avg_cost  # 卖出不改变平均成本
-                new_price = trade_price  # 卖出价
-
-            # 计算市值和收益
-            market_value = new_quantity * new_price
-            profit = market_value - new_quantity * new_avg_cost if new_quantity > 0 else 0
-
-            if new_quantity == 0:
-                # 清仓：删除持仓记录，但保留历史快照（最后一条将在后面插入）
-                cursor.execute("DELETE FROM positions WHERE stock_code = %s", (stock_code,))
-            else:
-                # 更新或插入持仓
-                if pos:
-                    cursor.execute("""
-                        UPDATE positions SET quantity=%s, avg_cost=%s, latest_price=%s,
-                        market_value=%s, profit=%s WHERE stock_code=%s
-                    """, (new_quantity, new_avg_cost, new_price, market_value, profit, stock_code))
-                else:
-                    cursor.execute("""
-                        INSERT INTO positions (stock_code, quantity, avg_cost, latest_price, market_value, profit)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                    """, (stock_code, new_quantity, new_avg_cost, new_price, market_value, profit))
-
-            # 记录快照到 position_history
-            notes = f"{action} {quantity} shares at {trade_price:.2f}" + (f" (signal_id={signal_id})" if signal_id else "")
+            # 获取所有交易记录，计算现金变动
             cursor.execute("""
-                INSERT INTO position_history (stock_code, snapshot_time, quantity, price, market_value, profit, notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (stock_code, datetime.now(), new_quantity, new_price, market_value, profit, notes))
+                SELECT action, amount FROM trades 
+                WHERE strategy_id = %s
+            """, (strategy_id,))
+            trades = cursor.fetchall()
+            cash = initial_capital
+            for t in trades:
+                amount = float(t['amount'])  # <--- amount 也是 Decimal，转为 float
+                if t['action'] == 'buy':
+                    cash -= amount
+                else:
+                    cash += amount
 
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
+            # 计算净持仓
+            cursor.execute("""
+                SELECT stock_code, 
+                       SUM(CASE WHEN action='buy' THEN quantity ELSE -quantity END) as net_qty
+                FROM trades
+                WHERE strategy_id = %s
+                GROUP BY stock_code
+                HAVING net_qty != 0
+            """, (strategy_id,))
+            positions = {row['stock_code']: row['net_qty'] for row in cursor.fetchall()}
+        return cash, positions
     finally:
         conn.close()
 
-# ================== 路由 ==================
+def get_current_nav(strategy_id, stock_list=None, price_type='close'):
+    """
+    获取策略当前总净值，或指定股票的当前净值
+    如果stock_list为None，返回总净值(float)；否则返回列表，每个元素为 {stock_code, nav}
+    """
+    cash, positions = calculate_strategy_cash_and_positions(strategy_id)
+    if cash is None:
+        return None
+
+    if stock_list is None:
+        # 总净值 = 现金 + 所有持仓市值
+        total_mv = 0.0
+        for stock_code, qty in positions.items():
+            qty = float(qty)
+            price = get_latest_price(stock_code, price_type)
+            if price:
+                total_mv += qty * price
+        return cash + total_mv
+    else:
+        # 返回指定股票的市值
+        result = []
+        for stock_code in stock_list:
+            qty = positions.get(stock_code, 0)
+            qty = float(qty)
+            if qty == 0:
+                result.append({'stock_code': stock_code, 'nav': 0.0})
+            else:
+                price = get_latest_price(stock_code, price_type)
+                nav = qty * price if price else 0.0
+                result.append({'stock_code': stock_code, 'nav': nav})
+        return result
+
+# ========== 路由 ==========
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/data_trace', methods=['POST'])
-def data_trace():
-    """接收买卖决策，处理交易并记录"""
+@app.route('/api/strategies', methods=['POST'])
+def add_strategies():
+    """
+    提交策略交易列表
+    请求体: JSON数组，每个元素:
+    {
+        "strategy_id": "strategy_001",
+        "initial_capital": 1000000,   # 可选，默认100万
+        "stocks": [ ... ]
+    }
+    """
     data = request.get_json()
-    if not data:
-        return jsonify({'error': '无效的JSON'}), 400
+    if not isinstance(data, list):
+        return jsonify({'error': '请求体应为数组'}), 400
 
-    # 必填字段校验
-    required = ['signal_id', 'timestamp', 'stock_code', 'action', 'quantity', 'price_type']
-    for field in required:
-        if field not in data:
-            return jsonify({'error': f'缺少字段: {field}'}), 400
-
-    signal_id = data['signal_id']
-    timestamp_str = data['timestamp']
-    stock_code = data['stock_code']
-    action = data['action']
-    quantity = data['quantity']
-    price_type = data['price_type']
-    confidence = data.get('confidence', 0.0)
-    news_source = data.get('news_source', '')
-
-    # 解析时间戳 (ISO格式: "2025-03-06T14:35")
+    conn = get_db()
     try:
-        dt = datetime.fromisoformat(timestamp_str)
-        date_str = dt.strftime('%Y%m%d')
-    except:
-        return jsonify({'error': 'timestamp格式错误，应为YYYY-MM-DDTHH:MM'}), 400
+        for strategy in data:
+            strategy_id = strategy.get('strategy_id')
+            if not strategy_id:
+                return jsonify({'error': '缺少 strategy_id'}), 400
 
-    # 根据price_type决定取哪一天的价格
-    # open: 下一个交易日开盘价 (这里简化用当天，实际可根据需要调整)
-    # close: 当天收盘价
-    # 注意：如果日期是今天且未收盘，可能获取不到，这里直接尝试获取，若失败则返回错误
-    if price_type == 'open':
-        # 简单使用当天开盘价，实际可调用交易日历获取下一个交易日
-        target_date = date_str
-    else:  # close
-        target_date = date_str
+            # 检查策略是否已存在
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM strategies WHERE strategy_id = %s", (strategy_id,))
+                exists = cursor.fetchone()
 
-    trade_price = get_price_from_tushare(stock_code, target_date, price_type)
-    if trade_price is None:
-        return jsonify({'error': f'无法获取{stock_code}在{target_date}的{price_type}价格'}), 400
+            # 如果策略已存在且请求中提供了 initial_capital，则拒绝
+            if exists and 'initial_capital' in strategy:
+                return jsonify({'error': f'策略 {strategy_id} 已存在，不能修改初始资金'}), 400
 
-    # 插入signals记录
-    conn = get_db_connection()
+            # 处理 initial_capital：如果不存在则插入时用默认值，存在则使用原值（不需要更新）
+            if not exists:
+                initial_capital = strategy.get('initial_capital', 1000000.0)
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO strategies (strategy_id, initial_capital) 
+                        VALUES (%s, %s)
+                    """, (strategy_id, initial_capital))
+
+            # 处理交易记录（无论策略新老都执行）
+            stocks = strategy.get('stocks', [])
+            if not stocks:
+                continue
+
+            for item in stocks:
+                stock_code = item.get('stock_code')
+                action = item.get('action')
+                quantity = item.get('quantity')
+                if not all([stock_code, action, quantity]):
+                    return jsonify({'error': '股票交易信息不完整'}), 400
+
+                # 日期处理：默认当天
+                trade_date_str = item.get('date')
+                if trade_date_str:
+                    try:
+                        trade_date = datetime.strptime(trade_date_str, '%Y-%m-%d').date()
+                    except:
+                        return jsonify({'error': f'日期格式错误: {trade_date_str}'}), 400
+                else:
+                    trade_date = date.today()
+
+                price_type = item.get('price_type', 'open')
+
+                # 获取价格
+                price = get_price_from_tushare(stock_code, trade_date, price_type)
+                if price is None:
+                    return jsonify({'error': f'无法获取{stock_code}在{trade_date}的{price_type}价格'}), 400
+
+                # 插入交易记录
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO trades 
+                        (strategy_id, stock_code, trade_date, action, quantity, price, price_type)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (strategy_id, stock_code, trade_date, action, quantity, price, price_type))
+
+        conn.commit()
+        return jsonify({'message': 'success'}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/strategies', methods=['GET'])
+def list_strategies():
+    """获取所有策略ID"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT strategy_id FROM strategies")
+            rows = cursor.fetchall()
+        return jsonify([r['strategy_id'] for r in rows])
+    finally:
+        conn.close()
+
+@app.route('/api/strategies/<strategy_id>/nav', methods=['GET'])
+def get_strategy_nav_history(strategy_id):
+    """
+    获取策略历史净值（百分比形式），计算每日开盘时的净值。
+    参数:
+        start_date: YYYY-MM-DD (可选)
+        end_date: YYYY-MM-DD (可选，默认今天)
+    """
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date', date.today().strftime('%Y-%m-%d'))
+    # 强制使用开盘价
+    price_type = 'open'
+
+    # 解析日期
+    try:
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        if start_date_str:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        else:
+            # 取策略最早交易日期
+            conn = get_db()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT MIN(trade_date) as first_date FROM trades WHERE strategy_id = %s", (strategy_id,))
+                row = cursor.fetchone()
+                first_date = row['first_date']
+            if not first_date:
+                return jsonify([])
+            start_date = first_date
+    except Exception as e:
+        return jsonify({'error': f'日期格式错误: {e}'}), 400
+
+    # 获取初始资金
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            row = cursor.fetchone()
+            if not row:
+                return jsonify({'error': '策略不存在'}), 404
+            initial_capital = float(row['initial_capital'])
+    finally:
+        conn.close()
+
+    # 获取涉及的所有股票代码
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT DISTINCT stock_code FROM trades WHERE strategy_id = %s", (strategy_id,))
+            stock_codes = [r['stock_code'] for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+    if not stock_codes:
+        return jsonify([])
+
+    # 生成日期范围
+    dates = []
+    current = start_date
+    while current <= end_date:
+        dates.append(current)
+        current += timedelta(days=1)
+
+    # ---------- 批量获取所有股票在日期范围内的开盘价 ----------
+    price_cache = {}          # (stock_code, date) -> price
+    last_price = {}           # 用于非交易日回退
+    for stock_code in stock_codes:
+        start_str = start_date.strftime('%Y%m%d')
+        end_str = end_date.strftime('%Y%m%d')
+        try:
+            df = pro.daily(ts_code=stock_code, start_date=start_str, end_date=end_str)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
+                    price = float(row['open'])   # 确保取开盘价
+                    price_cache[(stock_code, trade_date)] = price
+        except Exception as e:
+            print(f"获取 {stock_code} 价格失败: {e}")
+
+    # ---------- 获取所有交易并按日期排序 ----------
+    conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO signals (signal_id, timestamp, stock_code, action, quantity, price_type, confidence, news_source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (signal_id, dt, stock_code, action, quantity, price_type, confidence, news_source))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        return jsonify({'error': f'插入signals失败: {str(e)}'}), 500
+                SELECT trade_date, stock_code, action, quantity, price 
+                FROM trades 
+                WHERE strategy_id = %s 
+                ORDER BY trade_date
+            """, (strategy_id,))
+            trades = cursor.fetchall()
     finally:
         conn.close()
 
-    # 更新持仓
-    try:
-        update_position_after_trade(stock_code, action, quantity, trade_price, signal_id)
-    except ValueError as e:
-        return jsonify({'error': str(e)}), 400
-    except Exception as e:
-        return jsonify({'error': f'更新持仓失败: {str(e)}'}), 500
+    from collections import defaultdict
+    trades_by_date = defaultdict(list)
+    for t in trades:
+        trades_by_date[t['trade_date']].append(t)
 
-    return jsonify({'message': 'success', 'trade_price': trade_price}), 200
+    # ---------- 逐日计算开盘净值 ----------
+    cash = initial_capital
+    positions = defaultdict(float)   # 当前持仓（交易后），初始为空
 
-@app.route('/api/positions', methods=['GET'])
-def get_positions():
-    """返回当前所有持仓"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM positions ORDER BY stock_code")
-            rows = cursor.fetchall()
-        return jsonify(rows)
-    finally:
-        conn.close()
-
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    """返回持仓历史快照，可按股票过滤"""
-    stock_code = request.args.get('stock_code')
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            if stock_code:
-                cursor.execute("SELECT * FROM position_history WHERE stock_code = %s ORDER BY snapshot_time", (stock_code,))
+    result = []
+    for d in dates:
+        # 1. 计算当日开盘市值（基于前一交易日后持仓）
+        market_value_open = 0.0
+        for stock_code, qty in positions.items():
+            price = price_cache.get((stock_code, d))
+            if price is None:
+                # 非交易日或无数据：沿用最近一次价格
+                price = last_price.get(stock_code)
+                if price is None:
+                    continue
             else:
-                cursor.execute("SELECT * FROM position_history ORDER BY stock_code, snapshot_time")
-            rows = cursor.fetchall()
-        return jsonify(rows)
-    finally:
-        conn.close()
+                last_price[stock_code] = price
+            market_value_open += qty * price
 
-@app.route('/api/signals', methods=['GET'])
-def get_signals():
-    """返回所有决策记录"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM signals ORDER BY timestamp DESC")
-            rows = cursor.fetchall()
-        return jsonify(rows)
-    finally:
-        conn.close()
+        nav_open = cash + market_value_open
+        nav_percent_open = (nav_open / initial_capital) * 100
+        result.append({
+            'date': d.strftime('%Y-%m-%d'),
+            'nav': round(nav_open, 2),
+            'nav_percent': round(nav_percent_open, 2)
+        })
 
-@app.route('/api/refresh', methods=['POST'])
-def refresh_prices():
+        # 2. 处理当日交易，更新现金和持仓（用于下一天开盘）
+        day_trades = trades_by_date.get(d, [])
+        for t in day_trades:
+            qty = float(t['quantity'])
+            price = float(t['price'])
+            if t['action'] == 'buy':
+                cash -= qty * price
+                positions[t['stock_code']] += qty
+            else:
+                cash += qty * price
+                positions[t['stock_code']] -= qty
+                if positions[t['stock_code']] == 0:
+                    del positions[t['stock_code']]
+
+    return jsonify(result)
+
+@app.route('/api/strategies/<strategy_id>/current_nav', methods=['GET'])
+def get_current_nav_endpoint(strategy_id):
     """
-    手动触发更新所有持仓股票的最新价格，并记录快照
+    获取策略当前总净值或指定股票的当前净值
+    参数:
+        stocks: 逗号分隔的股票代码，如 "000001.SZ,000002.SZ" (可选)
+        price_type: open/close (默认close)
     """
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM positions")
-            positions = cursor.fetchall()
+    stocks_param = request.args.get('stocks')
+    price_type = request.args.get('price_type', 'close')
+    stock_list = stocks_param.split(',') if stocks_param else None
 
-        for pos in positions:
-            stock_code = pos['stock_code']
-            new_price = get_latest_price(stock_code)
-            if new_price is None:
-                continue  # 跳过无法获取的股票
+    result = get_current_nav(strategy_id, stock_list, price_type)
+    if result is None:
+        return jsonify({'error': '策略不存在'}), 404
 
-            # 更新持仓中的最新价格
-            market_value = pos['quantity'] * new_price
-            profit = market_value - pos['quantity'] * pos['avg_cost']
+    if stock_list is None:
+        initial_capital = None
+        conn = get_db()
+        try:
             with conn.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE positions SET latest_price=%s, market_value=%s, profit=%s WHERE stock_code=%s
-                """, (new_price, market_value, profit, stock_code))
+                cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
+                row = cursor.fetchone()
+                if row:
+                    initial_capital = float(row['initial_capital'])
+        finally:
+            conn.close()
+        if initial_capital:
+            percent = (result / initial_capital) * 100
+            return jsonify({'total_nav': result, 'nav_percent': round(percent, 2)})
+        else:
+            return jsonify({'total_nav': result})
+    else:
+        return jsonify(result)
 
-                # 记录快照
-                cursor.execute("""
-                    INSERT INTO position_history (stock_code, snapshot_time, quantity, price, market_value, profit, notes)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (stock_code, datetime.now(), pos['quantity'], new_price, market_value, profit, 'price refresh'))
+@app.route('/api/index/sh000300', methods=['GET'])
+def get_index_sh000300():
+    """
+    获取沪深300指数历史波动（百分比形式）
+    参数:
+        start_date: YYYY-MM-DD (必填)
+        end_date: YYYY-MM-DD (必填)
+        price_type: open/close (必填)
+    """
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    price_type = request.args.get('price_type')
 
+    if not all([start_date_str, end_date_str, price_type]):
+        return jsonify({'error': '缺少必要参数'}), 400
+
+    try:
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+    except:
+        return jsonify({'error': '日期格式错误'}), 400
+
+    # 获取沪深300指数数据
+    # 指数代码 '000300.SH'
+    df = pro.index_daily(ts_code='000300.SH', start_date=start_date.strftime('%Y%m%d'),
+                         end_date=end_date.strftime('%Y%m%d'))
+    if df.empty:
+        return jsonify({'error': '无数据'}), 404
+
+    df = df.sort_values('trade_date')
+    base_price = None
+    result = []
+    for _, row in df.iterrows():
+        date_str = row['trade_date']
+        date_obj = datetime.strptime(date_str, '%Y%m%d')
+        if price_type == 'open':
+            price = row['open']
+        else:
+            price = row['close']
+
+        if base_price is None:
+            base_price = price
+            percent_change = 0.0
+        else:
+            percent_change = (price - base_price) / base_price * 100
+
+        result.append({
+            'date': date_obj.strftime('%Y-%m-%d'),
+            'value': float(price),
+            'percent_change': round(percent_change, 2)
+        })
+
+    return jsonify(result)
+
+@app.route('/api/strategies/<strategy_id>', methods=['DELETE'])
+def delete_strategy(strategy_id):
+    """删除策略及其所有交易记录（利用外键级联删除）"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            # 检查策略是否存在
+            cursor.execute("SELECT 1 FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            if not cursor.fetchone():
+                return jsonify({'error': '策略不存在'}), 404
+
+            # 直接删除策略，由于外键设置了 ON DELETE CASCADE，关联的 trades 会自动删除
+            cursor.execute("DELETE FROM strategies WHERE strategy_id = %s", (strategy_id,))
         conn.commit()
-        return jsonify({'message': 'refresh completed'})
+        return jsonify({'message': 'success'}), 200
     except Exception as e:
         conn.rollback()
         return jsonify({'error': str(e)}), 500
