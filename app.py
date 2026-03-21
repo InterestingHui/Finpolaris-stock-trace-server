@@ -5,6 +5,8 @@ import pymysql
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import tushare as ts
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 
 # 配置日志输出到控制台
 import logging
@@ -60,18 +62,22 @@ def get_next_trading_day(dt: date, direction='next') -> date:
             return current
         current += timedelta(days=step)
 
-def get_price_from_tushare(stock_code, trade_date, price_type='open'):
+def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=True):
     """
-    获取指定股票在指定日期的价格，若非交易日则自动取下一个交易日
+    获取指定股票在指定日期的价格。
+    auto_next: 若为 True 且当天无数据，则自动取下一个交易日；若为 False 则直接返回 None。
     返回 (price, actual_date) 或 (None, None)
     """
-    print(f"[DEBUG] 获取价格: {stock_code} {trade_date} {price_type}")
+    print(f"[DEBUG] 获取价格: {stock_code} {trade_date} {price_type} auto_next={auto_next}")
     if isinstance(trade_date, date):
         trade_date = trade_date.strftime('%Y%m%d')
     try:
         # 先尝试当天
         df = pro.daily(ts_code=stock_code, start_date=trade_date, end_date=trade_date)
         if df.empty:
+            if not auto_next:
+                print(f"[WARN] {trade_date} 无数据，且 auto_next=False，返回 None")
+                return None, None
             print(f"[WARN] {trade_date} 无数据，尝试下一个交易日")
             next_date = get_next_trading_day(datetime.strptime(trade_date, '%Y%m%d').date(), 'next')
             next_str = next_date.strftime('%Y%m%d')
@@ -123,7 +129,10 @@ def get_latest_price(stock_code, price_type='close'):
     return None
 
 def calculate_strategy_cash_and_positions(strategy_id):
-    """计算当前现金和持仓（基于数据库已有交易）"""
+    """
+    计算当前现金和持仓（基于数据库已有成功交易）
+    直接查询 trades 表，因为该表只存储成功交易
+    """
     print(f"[DEBUG] 计算策略 {strategy_id} 现金和持仓")
     conn = get_db()
     try:
@@ -191,6 +200,196 @@ def get_current_nav(strategy_id, stock_list=None, price_type='close'):
                 result.append({'stock_code': stock_code, 'nav': nav})
         return result
 
+# ========== 交易执行函数 ==========
+def execute_trade(log_id, strategy_id, stock_code, action, quantity, target_date):
+    """
+    执行单笔交易，根据资金/持仓、涨跌停等条件决定成功或失败
+    更新 trade_logs 状态，成功时插入 trades 表
+    """
+    print(f"[DEBUG] 执行交易: log_id={log_id}, {strategy_id} {stock_code} {action} {quantity} on {target_date}")
+
+    today = date.today()
+    # 如果 target_date 是当天且是交易日，但可能盘中无价格数据，我们暂时跳过，等下次扫描
+    if target_date == today and is_trading_day(today):
+        # 尝试获取价格但不自动顺延，如果获取不到则跳过本次执行
+        price, actual_date = get_price_from_tushare(stock_code, target_date, 'open', auto_next=False)
+        if price is None:
+            print(f"[INFO] 当天 {target_date} 价格数据尚未就绪，稍后重试")
+            return  # 保持 pending，等待下次扫描
+    else:
+        # 非当天或非交易日，允许自动顺延
+        price, actual_date = get_price_from_tushare(stock_code, target_date, 'open', auto_next=True)
+
+    # 如果价格仍为 None，则失败（包括顺延后仍无数据）
+    if price is None:
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trade_logs 
+                    SET status='failed', fail_reason='停牌或无数据', actual_date=%s
+                    WHERE id=%s
+                """, (actual_date if actual_date else target_date, log_id))
+            conn.commit()
+            print(f"[DEBUG] 交易失败（停牌或无数据），日志已更新")
+        except Exception as e:
+            print(f"[ERROR] 更新日志失败: {e}")
+        finally:
+            conn.close()
+        return
+
+    # 获取当前策略现金和持仓（基于已完成交易）
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id=%s", (strategy_id,))
+            row = cursor.fetchone()
+            if not row:
+                print(f"[ERROR] 策略 {strategy_id} 不存在")
+                return
+            initial_capital = float(row['initial_capital'])
+
+            cursor.execute("SELECT action, amount FROM trades WHERE strategy_id = %s", (strategy_id,))
+            trades = cursor.fetchall()
+            cash = initial_capital
+            for t in trades:
+                amount = float(t['amount'])
+                if t['action'] == 'buy':
+                    cash -= amount
+                else:
+                    cash += amount
+
+            cursor.execute("""
+                SELECT stock_code, 
+                       SUM(CASE WHEN action='buy' THEN quantity ELSE -quantity END) as net_qty
+                FROM trades
+                WHERE strategy_id = %s
+                GROUP BY stock_code
+                HAVING net_qty != 0
+            """, (strategy_id,))
+            positions = {row['stock_code']: row['net_qty'] for row in cursor.fetchall()}
+    finally:
+        conn.close()
+
+    # 检查涨跌停
+    up_limit, down_limit = get_limit_price(stock_code, actual_date)
+    if action == 'buy' and up_limit is not None and abs(price - up_limit) < 0.001:
+        fail_reason = '涨停无法买入'
+        print(f"[WARN] {fail_reason}")
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trade_logs 
+                    SET status='failed', fail_reason=%s, actual_date=%s, price=%s
+                    WHERE id=%s
+                """, (fail_reason, actual_date, price, log_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    if action == 'sell' and down_limit is not None and abs(price - down_limit) < 0.001:
+        fail_reason = '跌停无法卖出'
+        print(f"[WARN] {fail_reason}")
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE trade_logs 
+                    SET status='failed', fail_reason=%s, actual_date=%s, price=%s
+                    WHERE id=%s
+                """, (fail_reason, actual_date, price, log_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+
+    # 检查资金/持仓
+    if action == 'buy':
+        cost = quantity * price
+        if cash < cost:
+            fail_reason = '资金不足'
+            print(f"[WARN] {fail_reason}: 需要{cost}, 当前现金{cash}")
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE trade_logs 
+                        SET status='failed', fail_reason=%s, actual_date=%s, price=%s
+                        WHERE id=%s
+                    """, (fail_reason, actual_date, price, log_id))
+                conn.commit()
+            finally:
+                conn.close()
+            return
+    else:  # sell
+        current_qty = positions.get(stock_code, 0)
+        if current_qty < quantity:
+            fail_reason = '持仓不足'
+            print(f"[WARN] {fail_reason}: 需要{quantity}, 当前持仓{current_qty}")
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE trade_logs 
+                        SET status='failed', fail_reason=%s, actual_date=%s, price=%s
+                        WHERE id=%s
+                    """, (fail_reason, actual_date, price, log_id))
+                conn.commit()
+            finally:
+                conn.close()
+            return
+
+    # 执行成功
+    print(f"[INFO] 交易成功: {strategy_id} {stock_code} {action} {quantity}@{price} {actual_date}")
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            # 插入 trades 表
+            cursor.execute("""
+                INSERT INTO trades 
+                (strategy_id, stock_code, trade_date, action, quantity, price, price_type)
+                VALUES (%s, %s, %s, %s, %s, %s, 'open')
+            """, (strategy_id, stock_code, actual_date, action, quantity, price))
+
+            # 更新 trade_logs 状态
+            cursor.execute("""
+                UPDATE trade_logs 
+                SET status='success', actual_date=%s, price=%s
+                WHERE id=%s
+            """, (actual_date, price, log_id))
+        conn.commit()
+        print(f"[DEBUG] 交易成功，日志状态已更新为 success")
+    except Exception as e:
+        conn.rollback()
+        print(f"[ERROR] 插入 trades 或更新日志失败: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        conn.close()
+
+# ========== 调度器：处理 pending 订单 ==========
+def process_pending_orders():
+    """扫描所有 pending 且 target_date <= 当前日期的订单，尝试执行"""
+    print("[DEBUG] 扫描 pending 订单...")
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            today = date.today()
+            cursor.execute("""
+                SELECT id, strategy_id, stock_code, action, quantity, target_date
+                FROM trade_logs
+                WHERE status='pending' AND target_date <= %s
+            """, (today,))
+            pending_orders = cursor.fetchall()
+        print(f"[DEBUG] 找到 {len(pending_orders)} 条待处理订单")
+    finally:
+        conn.close()
+
+    for order in pending_orders:
+        execute_trade(order['id'], order['strategy_id'], order['stock_code'],
+                      order['action'], order['quantity'], order['target_date'])
+
 # ========== 路由 ==========
 @app.route('/')
 def index():
@@ -199,7 +398,7 @@ def index():
 @app.route('/api/strategies', methods=['POST'])
 def add_strategies():
     """
-    提交策略交易列表，逐笔检查失败条件
+    提交策略交易列表，插入 pending 日志
     """
     print("[DEBUG] 收到 POST /api/strategies 请求")
     data = request.get_json()
@@ -237,20 +436,6 @@ def add_strategies():
                 print(f"[WARN] 策略 {strategy_id} 无股票交易")
                 continue
 
-            # ----- 获取当前现金和持仓 -----
-            if not exists:
-                # 新策略：现金 = 初始资金，持仓为空
-                current_cash = initial_capital
-                current_positions = {}
-                print(f"[DEBUG] 新策略，当前现金={current_cash}, 持仓为空")
-            else:
-                current_cash, current_positions = calculate_strategy_cash_and_positions(strategy_id)
-                if current_cash is None:
-                    print(f"[ERROR] 策略 {strategy_id} 数据异常")
-                    return jsonify({'error': f'策略 {strategy_id} 数据异常'}), 500
-                print(f"[DEBUG] 现有策略，当前现金={current_cash}, 当前持仓={current_positions}")
-
-            # 逐笔处理新交易
             for item in stocks:
                 stock_code = item.get('stock_code')
                 action = item.get('action')
@@ -259,117 +444,35 @@ def add_strategies():
                     print("[ERROR] 股票交易信息不完整")
                     return jsonify({'error': '股票交易信息不完整'}), 400
 
-                # ----- 确定意图交易日期 -----
+                # 确定 intended_date（用户意图）
                 if 'date' in item:
                     try:
-                        base_date = datetime.strptime(item['date'], '%Y-%m-%d').date()
-                        intended_date = base_date
-                        print(f"[DEBUG] 使用提供的日期: {intended_date}")
+                        intended_date = datetime.strptime(item['date'], '%Y-%m-%d').date()
+                        print(f"[DEBUG] 用户提供日期: {intended_date}")
                     except:
                         print(f"[ERROR] 日期格式错误: {item['date']}")
                         return jsonify({'error': f'日期格式错误: {item["date"]}'}), 400
                 else:
-                    now = datetime.now()
-                    today = now.date()
-                    if now.time() < MARKET_OPEN_TIME and is_trading_day(today):
-                        intended_date = today
-                    else:
-                        intended_date = get_next_trading_day(today, 'next')
-                    print(f"[DEBUG] 自动确定日期: {intended_date}")
+                    intended_date = date.today()
+                    print(f"[DEBUG] 未提供日期，使用今天: {intended_date}")
 
-                # 获取实际交易日期和价格
-                price, actual_date = get_price_from_tushare(stock_code, intended_date, 'open')
-                if price is None:
-                    fail_reason = '停牌或无数据'
-                    print(f"[WARN] {stock_code} {intended_date} {fail_reason}")
-                    # 记录失败日志
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            INSERT INTO trade_logs 
-                            (strategy_id, stock_code, action, quantity, intended_date, status, fail_reason)
-                            VALUES (%s, %s, %s, %s, %s, 'failed', %s)
-                        """, (strategy_id, stock_code, action, quantity, intended_date, fail_reason))
-                    continue
+                # 确定计划执行日期 target_date：如果是交易日则用当天，否则顺延到下一个交易日
+                if is_trading_day(intended_date):
+                    target_date = intended_date
+                else:
+                    target_date = get_next_trading_day(intended_date, 'next')
+                    print(f"[DEBUG] {intended_date} 非交易日，顺延至 {target_date}")
 
-                # 检查涨停/跌停
-                up_limit, down_limit = get_limit_price(stock_code, actual_date)
-                if action == 'buy' and up_limit is not None and abs(price - up_limit) < 0.001:
-                    fail_reason = '涨停无法买入'
-                    print(f"[WARN] {stock_code} {actual_date} {fail_reason}")
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            INSERT INTO trade_logs 
-                            (strategy_id, stock_code, action, quantity, intended_date, status, fail_reason)
-                            VALUES (%s, %s, %s, %s, %s, 'failed', %s)
-                        """, (strategy_id, stock_code, action, quantity, intended_date, fail_reason))
-                    continue
-                if action == 'sell' and down_limit is not None and abs(price - down_limit) < 0.001:
-                    fail_reason = '跌停无法卖出'
-                    print(f"[WARN] {stock_code} {actual_date} {fail_reason}")
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            INSERT INTO trade_logs 
-                            (strategy_id, stock_code, action, quantity, intended_date, status, fail_reason)
-                            VALUES (%s, %s, %s, %s, %s, 'failed', %s)
-                        """, (strategy_id, stock_code, action, quantity, intended_date, fail_reason))
-                    continue
-
-                # 检查资金/持仓
-                if action == 'buy':
-                    cost = quantity * price
-                    if current_cash < cost:
-                        fail_reason = '资金不足'
-                        print(f"[WARN] {fail_reason}: 需要{cost}, 当前现金{current_cash}")
-                        with conn.cursor() as cursor:
-                            cursor.execute("""
-                                INSERT INTO trade_logs 
-                                (strategy_id, stock_code, action, quantity, intended_date, status, fail_reason)
-                                VALUES (%s, %s, %s, %s, %s, 'failed', %s)
-                            """, (strategy_id, stock_code, action, quantity, intended_date, fail_reason))
-                        continue
-                else:  # sell
-                    current_qty = current_positions.get(stock_code, 0)
-                    if current_qty < quantity:
-                        fail_reason = '持仓不足'
-                        print(f"[WARN] {fail_reason}: 需要{quantity}, 当前持仓{current_qty}")
-                        with conn.cursor() as cursor:
-                            cursor.execute("""
-                                INSERT INTO trade_logs 
-                                (strategy_id, stock_code, action, quantity, intended_date, status, fail_reason)
-                                VALUES (%s, %s, %s, %s, %s, 'failed', %s)
-                            """, (strategy_id, stock_code, action, quantity, intended_date, fail_reason))
-                        continue
-
-                # 所有检查通过，执行交易
-                print(f"[INFO] 交易成功: {strategy_id} {stock_code} {action} {quantity}@{price} {actual_date}")
-                # 插入 trades 表
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO trades 
-                        (strategy_id, stock_code, trade_date, action, quantity, price, price_type)
-                        VALUES (%s, %s, %s, %s, %s, %s, 'open')
-                    """, (strategy_id, stock_code, actual_date, action, quantity, price))
-
-                # 插入成功日志
+                # 插入 pending 日志
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         INSERT INTO trade_logs 
-                        (strategy_id, stock_code, action, quantity, intended_date, actual_date, price, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'success')
-                    """, (strategy_id, stock_code, action, quantity, intended_date, actual_date, price))
-
-                # 更新当前现金和持仓（用于后续同批交易判断）
-                if action == 'buy':
-                    current_cash -= cost
-                    current_positions[stock_code] = current_positions.get(stock_code, 0) + quantity
-                else:
-                    current_cash += quantity * price
-                    current_positions[stock_code] = current_positions.get(stock_code, 0) - quantity
-                    if current_positions[stock_code] == 0:
-                        del current_positions[stock_code]
+                        (strategy_id, stock_code, action, quantity, intended_date, target_date, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                    """, (strategy_id, stock_code, action, quantity, intended_date, target_date))
 
         conn.commit()
-        print("[DEBUG] 所有交易处理完成，提交成功")
+        print("[DEBUG] 所有交易意向已记录为 pending")
         return jsonify({'message': 'success'}), 200
     except Exception as e:
         conn.rollback()
@@ -418,9 +521,8 @@ def get_strategy_nav_history(strategy_id):
                 row = cursor.fetchone()
                 first_date = row['first_date']
             if not first_date:
-                print(f"[WARN] 策略 {strategy_id} 无交易记录")
+                print(f"[WARN] 策略 {strategy_id} 无成功交易")
                 return jsonify([])
-            # 起始日设为第一个交易日当天
             start_date = first_date
             if start_date > end_date:
                 print(f"[WARN] 起始日期 {start_date} 晚于结束日期 {end_date}")
@@ -428,6 +530,8 @@ def get_strategy_nav_history(strategy_id):
             print(f"[DEBUG] 自动计算起始日: {start_date}")
     except Exception as e:
         print(f"[ERROR] 日期解析错误: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': f'日期格式错误: {e}'}), 400
 
     # 获取初始资金
@@ -443,7 +547,7 @@ def get_strategy_nav_history(strategy_id):
     finally:
         conn.close()
 
-    # 获取涉及的所有股票代码
+    # 获取涉及的所有股票代码（从成功交易）
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -456,7 +560,7 @@ def get_strategy_nav_history(strategy_id):
         print(f"[WARN] 策略 {strategy_id} 无股票代码")
         return jsonify([])
 
-    # 生成连续日期范围（每一天）
+    # 生成连续日期范围
     dates = []
     current = start_date
     while current <= end_date:
@@ -464,8 +568,8 @@ def get_strategy_nav_history(strategy_id):
         current += timedelta(days=1)
     print(f"[DEBUG] 日期范围: {dates[0]} 到 {dates[-1]}, 共 {len(dates)} 天")
 
-    # 批量获取交易日价格
-    price_cache = {}  # (stock_code, date) -> price (仅交易日)
+    # 批量获取价格
+    price_cache = {}
     for stock_code in stock_codes:
         start_str = start_date.strftime('%Y%m%d')
         end_str = end_date.strftime('%Y%m%d')
@@ -480,14 +584,14 @@ def get_strategy_nav_history(strategy_id):
         except Exception as e:
             print(f"[ERROR] 获取 {stock_code} 价格失败: {e}")
 
-    # 获取所有交易并按日期排序
+    # 获取所有成功交易并按日期排序
     conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT trade_date, stock_code, action, quantity, price 
-                FROM trades 
-                WHERE strategy_id = %s 
+                SELECT trade_date, stock_code, action, quantity, price
+                FROM trades
+                WHERE strategy_id = %s
                 ORDER BY trade_date
             """, (strategy_id,))
             trades = cursor.fetchall()
@@ -517,10 +621,9 @@ def get_strategy_nav_history(strategy_id):
         else:
             break
 
-    last_price = {}  # 用于非交易日价格回退
+    last_price = {}
     result = []
     for d in dates:
-        # 计算当日开盘市值
         market_value_open = 0.0
         for stock_code, qty in positions.items():
             price = price_cache.get((stock_code, d))
@@ -554,7 +657,7 @@ def get_strategy_nav_history(strategy_id):
                 if positions[t['stock_code']] == 0:
                     del positions[t['stock_code']]
 
-        # 为所有持仓股票更新 last_price（使用当天的价格，如果有）
+        # 更新 last_price
         for stock_code in positions.keys():
             if (stock_code, d) in price_cache:
                 last_price[stock_code] = price_cache[(stock_code, d)]
@@ -611,7 +714,6 @@ def get_index_sh000300():
         print("[ERROR] 日期格式错误")
         return jsonify({'error': '日期格式错误'}), 400
 
-    # 获取交易日数据
     df = pro.index_daily(ts_code='000300.SH',
                          start_date=start_date.strftime('%Y%m%d'),
                          end_date=end_date.strftime('%Y%m%d'))
@@ -620,20 +722,17 @@ def get_index_sh000300():
         return jsonify({'error': '无数据'}), 404
 
     df = df.sort_values('trade_date')
-    # 构建交易日价格映射
     price_map = {}
     for _, row in df.iterrows():
         date_obj = datetime.strptime(row['trade_date'], '%Y%m%d').date()
         price_map[date_obj] = float(row[price_type])
 
-    # 生成连续日期
     dates = []
     current = start_date
     while current <= end_date:
         dates.append(current)
         current += timedelta(days=1)
 
-    # 填充价格，非交易日沿用前一个交易日价格
     base_price = None
     result = []
     last_price = None
@@ -664,7 +763,7 @@ def get_index_sh000300():
 
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
-    """获取指定日期开盘前的持仓快照（含现金），非交易日返回最近交易日"""
+    """获取指定日期收盘后的持仓快照（含现金），并显示下一个交易日的预购股信息"""
     print(f"[DEBUG] 收到 GET /api/strategies/{strategy_id}/holdings")
     date_str = request.args.get('date')
     if not date_str:
@@ -676,10 +775,14 @@ def get_strategy_holdings_at_date(strategy_id):
         print("[ERROR] 日期格式错误")
         return jsonify({'error': '日期格式错误'}), 400
 
-    # 如果 target_date 不是交易日，向前找到最近交易日
+    # 如果 target_date 不是交易日，向前找到最近交易日（用于价格获取）
+    display_date = target_date
     if not is_trading_day(target_date):
         target_date = get_next_trading_day(target_date, 'prev')
-        print(f"[DEBUG] 调整为最近交易日: {target_date}")
+        print(f"[DEBUG] {display_date} 非交易日，调整为最近交易日: {target_date}")
+
+    # 计算下一个交易日（用于查询预购股）
+    next_trading_day = get_next_trading_day(target_date, 'next')
 
     conn = get_db()
     try:
@@ -691,17 +794,26 @@ def get_strategy_holdings_at_date(strategy_id):
                 return jsonify({'error': '策略不存在'}), 404
             initial_capital = float(row['initial_capital'])
 
-            # 获取 target_date 之前的交易（不含当天）
+            # 获取 target_date 及之前的成功交易（包含当天，即收盘后状态）
             cursor.execute("""
                 SELECT stock_code, action, quantity, price
                 FROM trades
-                WHERE strategy_id = %s AND trade_date < %s
+                WHERE strategy_id = %s AND trade_date <= %s
+                ORDER BY trade_date
             """, (strategy_id, target_date))
             trades = cursor.fetchall()
+
+            # 获取下一个交易日的 pending 订单
+            cursor.execute("""
+                SELECT stock_code, action, quantity, intended_date
+                FROM trade_logs
+                WHERE strategy_id = %s AND status='pending' AND target_date = %s
+            """, (strategy_id, next_trading_day))
+            pending_orders = cursor.fetchall()
     finally:
         conn.close()
 
-    # 计算现金和持仓
+    # 计算现金和持仓（按时间顺序累加）
     cash = initial_capital
     positions = defaultdict(float)
     for t in trades:
@@ -716,10 +828,10 @@ def get_strategy_holdings_at_date(strategy_id):
             if positions[t['stock_code']] == 0:
                 del positions[t['stock_code']]
 
-    # 获取 target_date 的开盘价
+    # 获取 target_date 的开盘价（用于计算持仓市值）
     price_cache = {}
     for stock_code in positions.keys():
-        price, _ = get_price_from_tushare(stock_code, target_date, 'open')
+        price, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=True)
         if price:
             price_cache[stock_code] = price
 
@@ -741,18 +853,30 @@ def get_strategy_holdings_at_date(strategy_id):
     nav = cash + total_mv
     nav_percent = (nav / initial_capital) * 100
 
-    print(f"[DEBUG] 返回持仓快照: 日期={target_date}, 现金={cash}, 净值={nav}")
+    # 构建预购股列表
+    pending_list = []
+    for p in pending_orders:
+        pending_list.append({
+            'stock_code': p['stock_code'],
+            'action': p['action'],
+            'quantity': p['quantity'],
+            'intended_date': p['intended_date'].strftime('%Y-%m-%d') if p['intended_date'] else None,
+            'target_date': next_trading_day.strftime('%Y-%m-%d')
+        })
+
+    print(f"[DEBUG] 返回持仓快照: 日期={display_date}, 现金={cash}, 净值={nav}, 预购股数={len(pending_list)}")
     return jsonify({
-        'date': target_date.strftime('%Y-%m-%d'),
+        'date': display_date.strftime('%Y-%m-%d'),
         'cash': round(cash, 2),
         'nav': round(nav, 2),
         'nav_percent': round(nav_percent, 2),
-        'holdings': holdings_list
+        'holdings': holdings_list,
+        'pending_orders': pending_list
     })
 
 @app.route('/api/strategies/<strategy_id>/trades', methods=['GET'])
 def get_strategy_trades(strategy_id):
-    """获取策略的所有交易记录（无日期筛选）"""
+    """获取策略的所有成功交易记录"""
     print(f"[DEBUG] 收到 GET /api/strategies/{strategy_id}/trades")
     conn = get_db()
     try:
@@ -775,7 +899,7 @@ def get_strategy_trades(strategy_id):
 
 @app.route('/api/strategies/<strategy_id>/logs', methods=['GET'])
 def get_strategy_logs(strategy_id):
-    """获取策略的所有交易日志（成功+失败）"""
+    """获取策略的所有交易日志（包含 pending、success、failed）"""
     print(f"[DEBUG] 收到 GET /api/strategies/{strategy_id}/logs")
     conn = get_db()
     try:
@@ -808,9 +932,7 @@ def delete_strategy(strategy_id):
                 print(f"[WARN] 策略 {strategy_id} 不存在")
                 return jsonify({'error': '策略不存在'}), 404
 
-            # 先删除日志（因为日志没有外键关联）
             cursor.execute("DELETE FROM trade_logs WHERE strategy_id = %s", (strategy_id,))
-            # 再删除策略（级联删除 trades）
             cursor.execute("DELETE FROM strategies WHERE strategy_id = %s", (strategy_id,))
         conn.commit()
         print(f"[DEBUG] 策略 {strategy_id} 删除成功")
@@ -823,6 +945,12 @@ def delete_strategy(strategy_id):
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
+
+# ========== 启动调度器 ==========
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     app.run(debug=True)
