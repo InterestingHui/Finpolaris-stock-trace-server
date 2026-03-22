@@ -504,11 +504,20 @@ def list_strategies():
 
 @app.route('/api/strategies/<strategy_id>/nav', methods=['GET'])
 def get_strategy_nav_history(strategy_id):
-    """获取策略历史净值（开盘价），从最早交易当天开始，非交易日沿用前值"""
+    """
+    获取策略历史净值，支持指定价格类型（open/close）
+    从最早交易日前一天开始，展示初始净值（100%），最早交易日净值反映收盘后状态。
+    参数:
+        start_date: YYYY-MM-DD (可选)
+        end_date: YYYY-MM-DD (可选，默认今天)
+        price_type: open 或 close，默认 open
+    """
     print(f"[DEBUG] 收到 GET /api/strategies/{strategy_id}/nav 请求")
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date', date.today().strftime('%Y-%m-%d'))
-    price_type = 'open'
+    price_type = request.args.get('price_type', 'open')
+    if price_type not in ['open', 'close']:
+        price_type = 'open'
 
     try:
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
@@ -523,11 +532,12 @@ def get_strategy_nav_history(strategy_id):
             if not first_date:
                 print(f"[WARN] 策略 {strategy_id} 无成功交易")
                 return jsonify([])
-            start_date = first_date
+            # 起始日设为第一个交易日的前一天（用于展示初始净值）
+            start_date = first_date - timedelta(days=1)
             if start_date > end_date:
                 print(f"[WARN] 起始日期 {start_date} 晚于结束日期 {end_date}")
                 return jsonify([])
-            print(f"[DEBUG] 自动计算起始日: {start_date}")
+            print(f"[DEBUG] 自动计算起始日: {start_date} (最早交易日: {first_date})")
     except Exception as e:
         print(f"[ERROR] 日期解析错误: {e}")
         import traceback
@@ -560,7 +570,7 @@ def get_strategy_nav_history(strategy_id):
         print(f"[WARN] 策略 {strategy_id} 无股票代码")
         return jsonify([])
 
-    # 生成连续日期范围
+    # 生成连续日期范围（包含起始日到结束日）
     dates = []
     current = start_date
     while current <= end_date:
@@ -568,7 +578,7 @@ def get_strategy_nav_history(strategy_id):
         current += timedelta(days=1)
     print(f"[DEBUG] 日期范围: {dates[0]} 到 {dates[-1]}, 共 {len(dates)} 天")
 
-    # 批量获取价格
+    # 批量获取价格（根据 price_type）
     price_cache = {}
     for stock_code in stock_codes:
         start_str = start_date.strftime('%Y%m%d')
@@ -578,7 +588,7 @@ def get_strategy_nav_history(strategy_id):
             if not df.empty:
                 for _, row in df.iterrows():
                     trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
-                    price = float(row['open'])
+                    price = float(row[price_type])
                     price_cache[(stock_code, trade_date)] = price
             print(f"[DEBUG] 股票 {stock_code} 获取到 {len(df)} 条价格记录")
         except Exception as e:
@@ -602,10 +612,14 @@ def get_strategy_nav_history(strategy_id):
     for t in trades:
         trades_by_date[t['trade_date']].append(t)
 
-    # 预处理：计算 start_date 开盘前的现金和持仓
+    # 找到第一个有交易的日期
+    first_trade_date = trades[0]['trade_date'] if trades else None
+
+    # 初始化现金和持仓
     cash = initial_capital
     positions = defaultdict(float)
 
+    # 预处理：对于 start_date 之前的交易（如果用户指定了更早的 start_date），先应用
     for t in trades:
         if t['trade_date'] < start_date:
             qty = float(t['quantity'])
@@ -623,8 +637,47 @@ def get_strategy_nav_history(strategy_id):
 
     last_price = {}
     result = []
+
     for d in dates:
-        market_value_open = 0.0
+        # 特殊处理第一个交易日：先应用交易再计算净值
+        if d == first_trade_date:
+            # 先处理当天的交易
+            day_trades = trades_by_date.get(d, [])
+            for t in day_trades:
+                qty = float(t['quantity'])
+                price = float(t['price'])
+                if t['action'] == 'buy':
+                    cash -= qty * price
+                    positions[t['stock_code']] += qty
+                else:
+                    cash += qty * price
+                    positions[t['stock_code']] -= qty
+                    if positions[t['stock_code']] == 0:
+                        del positions[t['stock_code']]
+
+            # 计算当日净值
+            market_value = 0.0
+            for stock_code, qty in positions.items():
+                price = price_cache.get((stock_code, d))
+                if price is None:
+                    price = last_price.get(stock_code)
+                    if price is None:
+                        continue
+                else:
+                    last_price[stock_code] = price
+                market_value += qty * price
+
+            nav = cash + market_value
+            nav_percent = (nav / initial_capital) * 100
+            result.append({
+                'date': d.strftime('%Y-%m-%d'),
+                'nav': round(nav, 2),
+                'nav_percent': round(nav_percent, 2)
+            })
+            continue
+
+        # 其他日期：先计算开盘前净值，再应用当日交易
+        market_value = 0.0
         for stock_code, qty in positions.items():
             price = price_cache.get((stock_code, d))
             if price is None:
@@ -633,17 +686,17 @@ def get_strategy_nav_history(strategy_id):
                     continue
             else:
                 last_price[stock_code] = price
-            market_value_open += qty * price
+            market_value += qty * price
 
-        nav_open = cash + market_value_open
-        nav_percent_open = (nav_open / initial_capital) * 100
+        nav = cash + market_value
+        nav_percent = (nav / initial_capital) * 100
         result.append({
             'date': d.strftime('%Y-%m-%d'),
-            'nav': round(nav_open, 2),
-            'nav_percent': round(nav_percent_open, 2)
+            'nav': round(nav, 2),
+            'nav_percent': round(nav_percent, 2)
         })
 
-        # 处理当日交易
+        # 处理当日交易（更新现金和持仓，用于下一天）
         day_trades = trades_by_date.get(d, [])
         for t in day_trades:
             qty = float(t['quantity'])
@@ -763,9 +816,15 @@ def get_index_sh000300():
 
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
-    """获取指定日期收盘后的持仓快照（含现金），并显示下一个交易日的预购股信息"""
+    """
+    获取指定日期收盘后的持仓快照，包含开盘价和收盘价相关数据
+    参数:
+        date: YYYY-MM-DD
+        price_type: open 或 close，用于计算整体净值（默认为 open）
+    """
     print(f"[DEBUG] 收到 GET /api/strategies/{strategy_id}/holdings")
     date_str = request.args.get('date')
+    price_type = request.args.get('price_type', 'open')
     if not date_str:
         print("[ERROR] 缺少 date 参数")
         return jsonify({'error': '缺少 date 参数'}), 400
@@ -828,27 +887,43 @@ def get_strategy_holdings_at_date(strategy_id):
             if positions[t['stock_code']] == 0:
                 del positions[t['stock_code']]
 
-    # 获取 target_date 的开盘价（用于计算持仓市值）
-    price_cache = {}
+    # 获取 target_date 的开盘价和收盘价
+    price_cache_open = {}
+    price_cache_close = {}
     for stock_code in positions.keys():
-        price, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=True)
-        if price:
-            price_cache[stock_code] = price
+        price_open, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=True)
+        if price_open:
+            price_cache_open[stock_code] = price_open
+        price_close, _ = get_price_from_tushare(stock_code, target_date, 'close', auto_next=True)
+        if price_close:
+            price_cache_close[stock_code] = price_close
 
-    total_mv = 0.0
+    total_mv_open = 0.0
+    total_mv_close = 0.0
     holdings_list = []
     for stock_code, qty in positions.items():
-        price = price_cache.get(stock_code)
-        if price is None:
+        price_open = price_cache_open.get(stock_code)
+        price_close = price_cache_close.get(stock_code)
+        if price_open is None and price_close is None:
             continue
-        mv = qty * price
-        total_mv += mv
+        mv_open = qty * (price_open if price_open else 0)
+        mv_close = qty * (price_close if price_close else 0)
+        total_mv_open += mv_open
+        total_mv_close += mv_close
         holdings_list.append({
             'stock_code': stock_code,
             'quantity': qty,
-            'price': price,
-            'market_value': mv
+            'open_price': price_open if price_open else None,
+            'close_price': price_close if price_close else None,
+            'open_market_value': mv_open,
+            'close_market_value': mv_close
         })
+
+    # 根据 price_type 参数计算整体净值
+    if price_type == 'open':
+        total_mv = total_mv_open
+    else:
+        total_mv = total_mv_close
 
     nav = cash + total_mv
     nav_percent = (nav / initial_capital) * 100

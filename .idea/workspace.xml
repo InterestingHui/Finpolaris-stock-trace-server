@@ -4,8 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a01132e1-9bc0-42c6-b24e-e5d7a192f846" name="Changes" comment="3.8 第二版修改">
-      <change beforePath="$PROJECT_DIR$/.idea/dataSources.local.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/dataSources.local.xml" afterDir="false" />
+    <list default="true" id="a01132e1-9bc0-42c6-b24e-e5d7a192f846" name="Changes" comment="3.22 第四版修改">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/app.py" beforeDir="false" afterPath="$PROJECT_DIR$/app.py" afterDir="false" />
     </list>
@@ -109,7 +108,8 @@
       <workItem from="1772809039398" duration="31070000" />
       <workItem from="1774054666937" duration="5168000" />
       <workItem from="1774105040141" duration="902000" />
-      <workItem from="1774111868647" duration="8073000" />
+      <workItem from="1774111868647" duration="9134000" />
+      <workItem from="1774168070533" duration="1995000" />
     </task>
     <task id="LOCAL-00001" summary="3.8 第二版修改">
       <option name="closed" value="true" />
@@ -135,7 +135,15 @@
       <option name="project" value="LOCAL" />
       <updated>1774113653331</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="3.22 第四版修改">
+      <option name="closed" value="true" />
+      <created>1774124725252</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1774124725252</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -144,9 +152,10 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="3.8 第二版修改" />
     <MESSAGE value="3.14 第散版修改" />
-    <option name="LAST_COMMIT_MESSAGE" value="3.14 第散版修改" />
+    <MESSAGE value="3.22 第四版修改" />
+    <option name="LAST_COMMIT_MESSAGE" value="3.22 第四版修改" />
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/Stock_Trace$app.coverage" NAME="app Coverage Results" MODIFIED="1774123201989" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/Stock_Trace$app.coverage" NAME="app Coverage Results" MODIFIED="1774177320619" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
