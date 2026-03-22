@@ -1,9 +1,10 @@
 # app.py
 import os
+import logging
 import json
 from datetime import datetime, timedelta
 import pymysql
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_from_directory
 from flask_cors import CORS
 import tushare as ts
 
@@ -14,19 +15,30 @@ CORS(app)  # 允许跨域请求
 TUSHARE_TOKEN = 'de81b74f57902d498037a789ac0f31b5e485df1bff7f0bfe211e8a41'  # 请替换为真实token
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
+logging.basicConfig(level=logging.DEBUG)
 
 # 数据库连接配置
 DB_CONFIG = {
-    'host': 'localhost',
+    'host': '127.0.0.1',
     'user': 'root',
-    'password': 'lianghui',  # 请替换
-    'database': 'stock_trace',
+    'password': 'lianghui',
+    'database': 'trading_db',
     'charset': 'utf8mb4',
-    'cursorclass': pymysql.cursors.DictCursor
+    'cursorclass': pymysql.cursors.DictCursor,
+    'connect_timeout': 5,      # 新增：连接超时5秒
+    'read_timeout': 10,        # 可选：读取超时
+    'write_timeout': 10        # 可选：写入超时
 }
 
 def get_db_connection():
-    return pymysql.connect(**DB_CONFIG)
+    try:
+        logging.info(f"Connecting to MySQL: {DB_CONFIG['host']}")
+        conn = pymysql.connect(**DB_CONFIG)
+        logging.info("Connection successful")
+        return conn
+    except Exception as e:
+        logging.error(f"Database connection failed: {e}")
+        raise e
 
 # ================== 工具函数 ==================
 def get_price_from_tushare(stock_code, date, price_type):
@@ -126,11 +138,13 @@ def update_position_after_trade(stock_code, action, quantity, trade_price, signa
 # ================== 路由 ==================
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return send_from_directory('/home/admin/Finpolaris-stock-trace-web', 'index.html')
 
-@app.route('/data_trace', methods=['POST'])
+@app.route('/data_trace', methods=['POST', 'OPTIONS'])
 def data_trace():
     """接收买卖决策，处理交易并记录"""
+    if request.method == 'OPTIONS':
+        return '', 200  # 预检请求直接返回成功
     data = request.get_json()
     if not data:
         return jsonify({'error': '无效的JSON'}), 400
@@ -196,9 +210,11 @@ def data_trace():
 
     return jsonify({'message': 'success', 'trade_price': trade_price}), 200
 
-@app.route('/api/positions', methods=['GET'])
+@app.route('/api/positions', methods=['GET', 'OPTIONS'])
 def get_positions():
     """返回当前所有持仓"""
+    if request.method == 'OPTIONS':
+        return '', 200  # 预检请求直接返回成功
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -208,9 +224,11 @@ def get_positions():
     finally:
         conn.close()
 
-@app.route('/api/history', methods=['GET'])
+@app.route('/api/history', methods=['GET', 'OPTIONS'])
 def get_history():
     """返回持仓历史快照，可按股票过滤"""
+    if request.method == 'OPTIONS':
+        return '', 200  # 预检请求直接返回成功
     stock_code = request.args.get('stock_code')
     conn = get_db_connection()
     try:
@@ -224,9 +242,11 @@ def get_history():
     finally:
         conn.close()
 
-@app.route('/api/signals', methods=['GET'])
+@app.route('/api/signals', methods=['GET', 'OPTIONS'])
 def get_signals():
     """返回所有决策记录"""
+    if request.method == 'OPTIONS':
+        return '', 200  # 预检请求直接返回成功
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -236,11 +256,13 @@ def get_signals():
     finally:
         conn.close()
 
-@app.route('/api/refresh', methods=['POST'])
+@app.route('/api/refresh', methods=['POST', 'OPTIONS'])
 def refresh_prices():
     """
     手动触发更新所有持仓股票的最新价格，并记录快照
     """
+    if request.method == 'OPTIONS':
+        return '', 200  # 预检请求直接返回成功
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -276,4 +298,4 @@ def refresh_prices():
         conn.close()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
