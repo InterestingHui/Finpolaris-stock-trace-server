@@ -458,7 +458,7 @@ def add_strategies():
                     intended_date = date.today()
                     print(f"[DEBUG] 未提供日期，使用今天: {intended_date}")
 
-                # 计划执行日期：如果是交易日则用当天，否则非交易日直接失败（不再顺延）
+                # 计划执行日期：如果是交易日则用当天，否则非交易日直接失败
                 if is_trading_day(intended_date):
                     target_date = intended_date
                 else:
@@ -827,7 +827,7 @@ def get_index_sh000300():
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
     """
-    获取指定日期收盘后的持仓快照，包含开盘价和收盘价相关数据
+    获取指定日期收盘后的持仓快照，包含开盘价、收盘价数据以及每个股票的批次明细（FIFO）。
     参数:
         date: YYYY-MM-DD
         price_type: open 或 close，用于计算整体净值（默认为 open）
@@ -865,10 +865,10 @@ def get_strategy_holdings_at_date(strategy_id):
 
             # 获取 target_date 及之前的成功交易（包含当天，即收盘后状态）
             cursor.execute("""
-                SELECT stock_code, action, quantity, price
+                SELECT stock_code, action, quantity, price, trade_date
                 FROM trades
                 WHERE strategy_id = %s AND trade_date <= %s
-                ORDER BY trade_date
+                ORDER BY trade_date, id
             """, (strategy_id, target_date))
             trades = cursor.fetchall()
 
@@ -882,20 +882,45 @@ def get_strategy_holdings_at_date(strategy_id):
     finally:
         conn.close()
 
-    # 计算现金和持仓（按时间顺序累加）
+    # 计算现金和持仓（按时间顺序累加），同时构建每个股票的批次队列（FIFO）
     cash = initial_capital
     positions = defaultdict(float)
+    stock_batches = defaultdict(list)   # {stock_code: list of {quantity, buy_date}}
+
     for t in trades:
         qty = float(t['quantity'])
         price = float(t['price'])
+        trade_date = t['trade_date']
         if t['action'] == 'buy':
             cash -= qty * price
             positions[t['stock_code']] += qty
-        else:
+            # 添加买入批次
+            stock_batches[t['stock_code']].append({
+                'quantity': qty,
+                'buy_date': trade_date
+            })
+        else:  # sell
             cash += qty * price
+            # FIFO 卖出：从队列头部依次扣减
+            remaining_sell = qty
+            batches = stock_batches[t['stock_code']]
+            while remaining_sell > 0 and batches:
+                first_batch = batches[0]
+                if first_batch['quantity'] > remaining_sell:
+                    first_batch['quantity'] -= remaining_sell
+                    remaining_sell = 0
+                else:
+                    remaining_sell -= first_batch['quantity']
+                    batches.pop(0)
+            # 更新总持仓（卖出后可能为零）
             positions[t['stock_code']] -= qty
             if positions[t['stock_code']] == 0:
                 del positions[t['stock_code']]
+                # 清空该股票的批次列表（已全部卖出）
+                stock_batches[t['stock_code']] = []
+            else:
+                # 更新持仓后，批次列表可能已经改变
+                pass
 
     # 获取 target_date 的开盘价和收盘价
     price_cache_open = {}
@@ -911,6 +936,7 @@ def get_strategy_holdings_at_date(strategy_id):
     total_mv_open = 0.0
     total_mv_close = 0.0
     holdings_list = []
+
     for stock_code, qty in positions.items():
         price_open = price_cache_open.get(stock_code)
         price_close = price_cache_close.get(stock_code)
@@ -920,13 +946,21 @@ def get_strategy_holdings_at_date(strategy_id):
         mv_close = qty * (price_close if price_close else 0)
         total_mv_open += mv_open
         total_mv_close += mv_close
+
+        # 构建批次明细
+        batches_detail = []
+        for batch in stock_batches[stock_code]:
+            holding_days = (target_date - batch['buy_date']).days
+            batches_detail.append([batch['quantity'], holding_days])
+
         holdings_list.append({
             'stock_code': stock_code,
             'quantity': qty,
             'open_price': price_open if price_open else None,
             'close_price': price_close if price_close else None,
             'open_market_value': mv_open,
-            'close_market_value': mv_close
+            'close_market_value': mv_close,
+            'batches': batches_detail   # 新增批次明细
         })
 
     # 根据 price_type 参数计算整体净值
