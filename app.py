@@ -1006,32 +1006,6 @@ def get_strategy_logs(strategy_id):
     finally:
         conn.close()
 
-@app.route('/api/strategies/<strategy_id>', methods=['DELETE'])
-def delete_strategy(strategy_id):
-    """删除策略及其所有关联数据（包括交易记录和日志）"""
-    print(f"[DEBUG] 收到 DELETE /api/strategies/{strategy_id}")
-    conn = get_db()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM strategies WHERE strategy_id = %s", (strategy_id,))
-            if not cursor.fetchone():
-                print(f"[WARN] 策略 {strategy_id} 不存在")
-                return jsonify({'error': '策略不存在'}), 404
-
-            cursor.execute("DELETE FROM trade_logs WHERE strategy_id = %s", (strategy_id,))
-            cursor.execute("DELETE FROM strategies WHERE strategy_id = %s", (strategy_id,))
-        conn.commit()
-        print(f"[DEBUG] 策略 {strategy_id} 删除成功")
-        return jsonify({'message': 'success'}), 200
-    except Exception as e:
-        conn.rollback()
-        print(f"[ERROR] delete_strategy 异常: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
-    finally:
-        conn.close()
-
 @app.route('/api/strategies/<strategy_id>/trades/<int:stock_id>', methods=['DELETE'])
 def delete_pending_trade(strategy_id, stock_id):
     """撤销指定策略下指定 stock_id 的 pending 交易"""
@@ -1056,7 +1030,7 @@ def delete_pending_trade(strategy_id, stock_id):
             if row['status'] != 'pending':
                 return jsonify({'error': f'交易状态为 {row["status"]}，无法撤销'}), 400
 
-            # 删除该交易日志（实际业务中也可标记为取消，但需求是撤销，直接删除即可）
+            # 删除该交易日志
             cursor.execute("DELETE FROM trade_logs WHERE id = %s", (row['id'],))
         conn.commit()
         print(f"[DEBUG] 交易 {stock_id} 已撤销")
@@ -1064,6 +1038,32 @@ def delete_pending_trade(strategy_id, stock_id):
     except Exception as e:
         conn.rollback()
         print(f"[ERROR] 撤销交易失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
+
+@app.route('/api/strategies/<strategy_id>', methods=['DELETE'])
+def delete_strategy(strategy_id):
+    """删除策略及其所有关联数据（包括交易记录和日志）"""
+    print(f"[DEBUG] 收到 DELETE /api/strategies/{strategy_id}")
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            if not cursor.fetchone():
+                print(f"[WARN] 策略 {strategy_id} 不存在")
+                return jsonify({'error': '策略不存在'}), 404
+
+            cursor.execute("DELETE FROM trade_logs WHERE strategy_id = %s", (strategy_id,))
+            cursor.execute("DELETE FROM strategies WHERE strategy_id = %s", (strategy_id,))
+        conn.commit()
+        print(f"[DEBUG] 策略 {strategy_id} 删除成功")
+        return jsonify({'message': 'success'}), 200
+    except Exception as e:
+        conn.rollback()
+        print(f"[ERROR] delete_strategy 异常: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
