@@ -1,3 +1,4 @@
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, date, time
@@ -20,11 +21,17 @@ TUSHARE_TOKEN = 'de81b74f57902d498037a789ac0f31b5e485df1bff7f0bfe211e8a41'
 ts.set_token(TUSHARE_TOKEN)
 pro = ts.pro_api()
 
+# 读取环境变量，设置默认值
+DB_HOST = os.environ.get('DB_HOST', 'localhost')
+DB_USER = os.environ.get('DB_USER', 'root')
+DB_PASSWORD = os.environ.get('DB_PASSWORD', 'lianghui')
+DB_NAME = os.environ.get('DB_NAME', 'stock_trace')
+BASE_URL = os.environ.get('BASE_URL', '')
 DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': 'lianghui',
-    'database': 'stock_trace',
+    'host': DB_HOST,
+    'user': DB_USER,
+    'password': DB_PASSWORD,
+    'database': DB_NAME,
     'charset': 'utf8mb4',
     'cursorclass': pymysql.cursors.DictCursor
 }
@@ -391,10 +398,6 @@ def process_pending_orders():
                       order['action'], order['quantity'], order['target_date'])
 
 # ========== 路由 ==========
-@app.route('/')
-def index():
-    return render_template('index.html')
-
 @app.route('/api/strategies', methods=['POST'])
 def add_strategies():
     """
@@ -1028,4 +1031,4 @@ scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
