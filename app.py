@@ -829,9 +829,10 @@ def get_index_sh000300():
     return jsonify(result)
 
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
+@app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
     """
-    获取指定日期开盘前的持仓快照，包含开盘价、收盘价数据以及每个股票的批次明细（FIFO）。
+    获取指定日期收盘后的持仓快照，包含开盘价、收盘价数据以及每个股票的批次明细（FIFO）。
     参数:
         date: YYYY-MM-DD
         price_type: open 或 close，用于计算整体净值（默认为 open）
@@ -848,8 +849,10 @@ def get_strategy_holdings_at_date(strategy_id):
         print("[ERROR] 日期格式错误")
         return jsonify({'error': '日期格式错误'}), 400
 
-    # 如果 target_date 不是交易日，向前找到最近交易日（用于价格获取）
+    # 保存原始请求日期（用于展示和计算持股天数）
     display_date = target_date
+
+    # 如果 target_date 不是交易日，向前找到最近交易日（用于价格获取）
     if not is_trading_day(target_date):
         target_date = get_next_trading_day(target_date, 'prev')
         print(f"[DEBUG] {display_date} 非交易日，调整为最近交易日: {target_date}")
@@ -864,16 +867,16 @@ def get_strategy_holdings_at_date(strategy_id):
                 return jsonify({'error': '策略不存在'}), 404
             initial_capital = float(row['initial_capital'])
 
-            # 获取 target_date 及之前的成功交易（不含当天，即开盘前状态）
+            # 获取 target_date 及之前的成功交易（包含当天，即收盘后状态）
             cursor.execute("""
                 SELECT stock_code, action, quantity, price, trade_date
                 FROM trades
-                WHERE strategy_id = %s AND trade_date < %s
+                WHERE strategy_id = %s AND trade_date <= %s
                 ORDER BY trade_date, id
             """, (strategy_id, target_date))
             trades = cursor.fetchall()
 
-            # 获取 target_date 当天要执行的 pending 订单（包含 trade_id）
+            # 获取 target_date 当天要执行的 pending 订单
             cursor.execute("""
                 SELECT stock_code, trade_id, action, quantity, intended_date
                 FROM trade_logs
@@ -948,10 +951,10 @@ def get_strategy_holdings_at_date(strategy_id):
         total_mv_open += mv_open
         total_mv_close += mv_close
 
-        # 构建批次明细，持有天数从1开始计数
+        # 构建批次明细，持有天数从1开始计数，使用原始请求日期 display_date（自然日）
         batches_detail = []
         for batch in stock_batches[stock_code]:
-            holding_days = (target_date - batch['buy_date']).days + 1
+            holding_days = (display_date - batch['buy_date']).days + 1  # 使用 display_date 而非 target_date
             batches_detail.append([batch['quantity'], holding_days])
 
         holdings_list.append({
