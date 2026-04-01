@@ -1,7 +1,7 @@
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 import pymysql
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
@@ -58,6 +58,16 @@ def get_next_trading_day(dt: date, direction='next') -> date:
             return current
         current += timedelta(days=step)
 
+def count_trading_days(start_date: date, end_date: date) -> int:
+    """计算两个日期之间（包含两端）的交易日数量"""
+    count = 0
+    current = start_date
+    while current <= end_date:
+        if is_trading_day(current):
+            count += 1
+        current += timedelta(days=1)
+    return count
+
 def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=False):
     if isinstance(trade_date, date):
         trade_date = trade_date.strftime('%Y%m%d')
@@ -101,14 +111,13 @@ def get_latest_price(stock_code, price_type='close'):
         print(f"get_latest_price error: {e}")
     return None
 
-# ========== 缓存辅助函数 ==========
+# ========== 缓存辅助函数（日线仅开高低收） ==========
 def _get_cached_daily(stock_code: str, trade_date: date):
-    """从数据库缓存获取日线行情"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT open, close, high, low, volume, amount, amplitude, pct_chg, change_amount, turnover_rate
+                SELECT open, close, high, low
                 FROM stock_daily_cache
                 WHERE stock_code = %s AND trade_date = %s
             """, (stock_code, trade_date))
@@ -118,13 +127,7 @@ def _get_cached_daily(stock_code: str, trade_date: date):
                     'open': float(row['open']),
                     'close': float(row['close']),
                     'high': float(row['high']),
-                    'low': float(row['low']),
-                    'volume': int(row['volume']),
-                    'amount': float(row['amount']),
-                    'amplitude': float(row['amplitude']),
-                    'pct_chg': float(row['pct_chg']),
-                    'change_amount': float(row['change_amount']),
-                    'turnover_rate': float(row['turnover_rate']) if row['turnover_rate'] else None
+                    'low': float(row['low'])
                 }
     except Exception as e:
         print(f"[缓存] 读取日线失败: {e}")
@@ -133,23 +136,18 @@ def _get_cached_daily(stock_code: str, trade_date: date):
     return None
 
 def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
-    """保存日线行情到数据库缓存"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
                 INSERT INTO stock_daily_cache 
-                (stock_code, trade_date, open, close, high, low, volume, amount, amplitude, pct_chg, change_amount, turnover_rate)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (stock_code, trade_date, open, close, high, low)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                open=VALUES(open), close=VALUES(close), high=VALUES(high), low=VALUES(low),
-                volume=VALUES(volume), amount=VALUES(amount), amplitude=VALUES(amplitude),
-                pct_chg=VALUES(pct_chg), change_amount=VALUES(change_amount), turnover_rate=VALUES(turnover_rate)
+                open=VALUES(open), close=VALUES(close), high=VALUES(high), low=VALUES(low)
             """, (
                 stock_code, trade_date,
-                data['open'], data['close'], data['high'], data['low'],
-                data['volume'], data['amount'], data['amplitude'], data['pct_chg'],
-                data['change_amount'], data.get('turnover_rate')
+                data['open'], data['close'], data['high'], data['low']
             ))
         conn.commit()
     except Exception as e:
@@ -157,8 +155,33 @@ def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
     finally:
         conn.close()
 
+def fetch_stock_daily_info(stock_code: str, trade_date: date):
+    """获取股票日线行情（开高低收），优先缓存，否则 Tushare"""
+    cached = _get_cached_daily(stock_code, trade_date)
+    if cached:
+        print(f"[日线缓存] 命中 {stock_code} {trade_date}")
+        return cached
+
+    date_str = trade_date.strftime('%Y%m%d')
+    try:
+        df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
+        if df.empty:
+            return None
+        row = df.iloc[0]
+        data = {
+            'open': float(row['open']),
+            'close': float(row['close']),
+            'high': float(row['high']),
+            'low': float(row['low'])
+        }
+        _save_cached_daily(stock_code, trade_date, data)
+        return data
+    except Exception as e:
+        print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
+        return None
+
+# ========== 股票名称缓存 ==========
 def _get_cached_name(stock_code: str):
-    """从数据库缓存获取股票名称"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -172,7 +195,6 @@ def _get_cached_name(stock_code: str):
         conn.close()
 
 def _save_cached_name(stock_code: str, stock_name: str):
-    """保存股票名称到数据库缓存"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -186,55 +208,12 @@ def _save_cached_name(stock_code: str, stock_name: str):
     finally:
         conn.close()
 
-# ========== 带缓存的日线获取 ==========
-@lru_cache(maxsize=10000)
-def fetch_stock_daily_info(stock_code: str, trade_date: date):
-    """
-    获取股票日线行情，优先从缓存读取
-    """
-    # 1. 查数据库缓存
-    cached = _get_cached_daily(stock_code, trade_date)
-    if cached:
-        print(f"[日线缓存] 命中 {stock_code} {trade_date}")
-        return cached
-
-    # 2. 从AKShare获取
-    pure_code = stock_code.split('.')[0]
-    date_str = trade_date.strftime('%Y%m%d')
-    try:
-        df = ak.stock_zh_a_hist(symbol=pure_code, period="daily", start_date=date_str, end_date=date_str, adjust="")
-        if df is None or df.empty:
-            return None
-        row = df.iloc[0]
-        data = {
-            'open': float(row['开盘']),
-            'close': float(row['收盘']),
-            'high': float(row['最高']),
-            'low': float(row['最低']),
-            'volume': int(row['成交量']),
-            'amount': float(row['成交额']),
-            'amplitude': float(row['振幅']),
-            'pct_chg': float(row['涨跌幅']),
-            'change_amount': float(row['涨跌额']),
-            'turnover_rate': float(row['换手率']) if '换手率' in row else None
-        }
-        # 保存到数据库缓存
-        _save_cached_daily(stock_code, trade_date, data)
-        return data
-    except Exception as e:
-        print(f"[日线] 获取失败 {stock_code} {date_str}: {e}")
-        return None
-
-# ========== 带缓存的股票名称获取 ==========
 @lru_cache(maxsize=5000)
 def get_stock_name(stock_code: str) -> str:
-    """获取股票名称，优先从缓存读取"""
-    # 1. 查数据库缓存
     cached = _get_cached_name(stock_code)
     if cached:
         return cached
 
-    # 2. 从AKShare获取
     pure_code = stock_code.split('.')[0]
     try:
         df = ak.stock_zh_a_spot_em()
@@ -247,46 +226,35 @@ def get_stock_name(stock_code: str) -> str:
         print(f"[股票名称] 获取失败 {stock_code}: {e}")
     return None
 
-# ========== VWAP 计算（复用缓存） ==========
+# ========== VWAP 计算 ==========
+# ========== VWAP 计算（使用 Tushare 日线） ==========
 def get_vwap(stock_code: str, trade_date: date) -> float:
-    pure_code = stock_code.split('.')[0]
+    """
+    使用 Tushare 日线数据计算 VWAP。
+    Tushare 数据说明:
+        - vol: 成交量，单位是“手” (1手 = 100股)
+        - amount: 成交额，单位是“千元”
+    因此，VWAP (元/股) = (amount * 1000) / (vol * 100)
+    返回 None 表示获取失败。
+    """
     date_str = trade_date.strftime('%Y%m%d')
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=pure_code, period="1", start_date=date_str, end_date=date_str, adjust="")
-        if df is None or df.empty:
-            df = ak.stock_zh_a_hist_min_em(symbol=pure_code, period="5", start_date=date_str, end_date=date_str, adjust="")
-        if df is None or df.empty:
+        df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
+        if df.empty:
             return None
-        volume_col = None
-        turnover_col = None
-        for col in df.columns:
-            if '成交' in col and '量' in col:
-                volume_col = col
-            if '成交' in col and '额' in col:
-                turnover_col = col
-        if volume_col is None:
+        row = df.iloc[0]
+        amount = float(row['amount'])   # 成交额，单位：千元
+        vol = float(row['vol'])         # 成交量，单位：手
+        if vol == 0:
             return None
-        volumes_lots = df[volume_col].values
-        volumes_shares = [v * 100 for v in volumes_lots]
-        if turnover_col is not None:
-            turnovers = df[turnover_col].values
-            total_turnover = sum(turnovers)
-            total_volume = sum(volumes_shares)
-            if total_volume > 0:
-                return round(total_turnover / total_volume, 3)
-        price_col = '收盘' if '收盘' in df.columns else None
-        if price_col:
-            prices = df[price_col].values
-            total_value = sum(prices[i] * volumes_shares[i] for i in range(len(prices)))
-            total_volume = sum(volumes_shares)
-            if total_volume > 0:
-                return round(total_value / total_volume, 3)
-        return None
+        # 转换为正确的单位并计算
+        vwap = (amount * 1000) / (vol * 100)     # 元/股
+        return round(vwap, 3)
     except Exception as e:
-        print(f"[VWAP] 异常: {e}")
+        print(f"[VWAP] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
 
-# ========== 策略计算函数 ==========
+# ========== 策略计算 ==========
 def calculate_strategy_cash_and_positions(strategy_id):
     conn = get_db()
     try:
@@ -348,20 +316,6 @@ def get_current_nav(strategy_id, stock_list=None, price_type='close'):
 
 # ========== 交易执行 ==========
 def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, target_date):
-    # 检查重复（基于唯一约束的预先检查，避免不必要的计算）
-    conn = get_db()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM trades WHERE strategy_id = %s AND trade_id = %s", (strategy_id, trade_id))
-            if cursor.fetchone():
-                print(f"[WARN] 交易已存在，跳过执行: {strategy_id} trade_id={trade_id}")
-                # 已经成功过，只需将当前日志标记为 success（避免 pending 状态残留）
-                cursor.execute("UPDATE trade_logs SET status='success', actual_date=%s WHERE id=%s", (target_date, log_id))
-                conn.commit()
-                return
-    finally:
-        conn.close()
-
     # 1. 获取 VWAP
     vwap = get_vwap(stock_code, target_date)
     if vwap is None:
@@ -460,7 +414,7 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
                 conn.close()
             return
 
-    # 5. 成功：获取日线行情和股票名称（从缓存）
+    # 5. 成功：获取日线行情和股票名称
     daily_info = fetch_stock_daily_info(stock_code, target_date)
     stock_name = get_stock_name(stock_code)
 
@@ -476,41 +430,30 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
             'open_price': daily_info['open'],
             'close_price': daily_info['close'],
             'high_price': daily_info['high'],
-            'low_price': daily_info['low'],
-            'volume': daily_info['volume'],
-            'amount': daily_info['amount'],
-            'amplitude': daily_info['amplitude'],
-            'pct_chg': daily_info['pct_chg'],
-            'change_amount': daily_info['change_amount'],
-            'turnover_rate': daily_info.get('turnover_rate'),
+            'low_price': daily_info['low']
         })
 
     conn = get_db()
     try:
         with conn.cursor() as cursor:
-            # 插入 trades（唯一约束）
             cursor.execute("""
                 INSERT INTO trades (strategy_id, stock_code, trade_id, trade_date, action, quantity, price, price_type)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'vwap')
             """, (strategy_id, stock_code, trade_id, target_date, action, quantity, vwap))
-            # 更新 trade_logs
             set_clause = ', '.join([f"{k}=%s" for k in update_fields.keys()])
             values = list(update_fields.values()) + [log_id]
             cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
         conn.commit()
         print(f"[INFO] 交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{vwap}")
     except pymysql.err.IntegrityError as e:
-        # 唯一约束冲突：说明已经由另一个进程成功插入，当前只需将日志标记为 success 并忽略
         conn.rollback()
         print(f"[WARN] 唯一约束冲突，交易已存在，忽略本次重复执行: {e}")
         with conn.cursor() as cursor:
-            # 将当前日志状态改为 success（保持与实际一致），但不再重复插入 trades
             cursor.execute("UPDATE trade_logs SET status='success', actual_date=%s WHERE id=%s", (target_date, log_id))
         conn.commit()
     except Exception as e:
         conn.rollback()
         print(f"[ERROR] 交易执行失败: {e}")
-        # 其他异常时标记为失败
         with conn.cursor() as cursor:
             cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s WHERE id=%s", (str(e)[:255], log_id))
         conn.commit()
@@ -530,7 +473,24 @@ def process_pending_orders():
             pending_orders = cursor.fetchall()
     finally:
         conn.close()
+
     for order in pending_orders:
+        # 快速检查是否已存在成功交易
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM trades WHERE strategy_id = %s AND trade_id = %s",
+                               (order['strategy_id'], order['trade_id']))
+                if cursor.fetchone():
+                    with conn.cursor() as cursor2:
+                        cursor2.execute("UPDATE trade_logs SET status='success', actual_date=%s WHERE id=%s",
+                                        (order['target_date'], order['id']))
+                    conn.commit()
+                    print(f"[INFO] 交易已存在，日志标记为 success: {order['strategy_id']} trade_id={order['trade_id']}")
+                    continue
+        finally:
+            conn.close()
+
         execute_trade(order['id'], order['strategy_id'], order['stock_code'],
                       order['trade_id'], order['action'], order['quantity'], order['target_date'])
 
@@ -591,7 +551,7 @@ def add_strategies():
                 else:
                     with conn.cursor() as cursor:
                         cursor.execute("""
-                            INSERT INTO trade_logs 
+                            INSERT INTO trade_logs
                             (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date, status, fail_reason)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, 'failed', '非交易日')
                         """, (strategy_id, stock_code, trade_id, action, quantity, intended_date, intended_date))
@@ -599,7 +559,7 @@ def add_strategies():
 
                 with conn.cursor() as cursor:
                     cursor.execute("""
-                        INSERT INTO trade_logs 
+                        INSERT INTO trade_logs
                         (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date, status)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
                     """, (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date))
@@ -948,7 +908,8 @@ def get_strategy_holdings_at_date(strategy_id):
         total_mv_close += mv_close
         batches_detail = []
         for batch in stock_batches[stock_code]:
-            holding_days = (display_date - batch['buy_date']).days + 1
+            # 使用交易日计数函数计算实际持股天数
+            holding_days = count_trading_days(batch['buy_date'], display_date)
             batches_detail.append([batch['quantity'], holding_days])
         holdings_list.append({
             'stock_code': stock_code,
@@ -981,26 +942,6 @@ def get_strategy_holdings_at_date(strategy_id):
         'holdings': holdings_list,
         'pending_orders': pending_list
     })
-
-@app.route('/api/strategies/<strategy_id>/current_holdings', methods=['GET'])
-def get_current_holdings(strategy_id):
-    conn = get_db()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM strategies WHERE strategy_id = %s", (strategy_id,))
-            if not cursor.fetchone():
-                return jsonify({'error': '策略不存在'}), 404
-            cursor.execute("""
-                SELECT stock_code, SUM(CASE WHEN action='buy' THEN quantity ELSE -quantity END) as net_qty
-                FROM trades WHERE strategy_id = %s GROUP BY stock_code HAVING net_qty != 0
-            """, (strategy_id,))
-            rows = cursor.fetchall()
-            holdings = [{'stock_code': r['stock_code'], 'quantity': r['net_qty']} for r in rows]
-        return jsonify(holdings)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    finally:
-        conn.close()
 
 @app.route('/api/strategies/<strategy_id>/trades', methods=['GET'])
 def get_strategy_trades(strategy_id):
@@ -1074,18 +1015,11 @@ def delete_strategy(strategy_id):
     finally:
         conn.close()
 
-# ========== 启动 ==========
+# ========== 启动调度器 ==========
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
-# ========== 启动调度器（避免 debug 模式重复启动） ==========
 if __name__ == '__main__':
-    # 只在主进程或非 debug 模式下启动调度器
-    if not app.debug or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        scheduler = BackgroundScheduler()
-        scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
-        scheduler.start()
-        atexit.register(lambda: scheduler.shutdown())
     app.run(host='0.0.0.0', port=5000, debug=True)
