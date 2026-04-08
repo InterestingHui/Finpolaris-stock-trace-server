@@ -62,7 +62,6 @@ def is_trading_day(dt: date) -> bool:
     date_str = dt.strftime('%Y%m%d')
     if date_str in _trade_calendar_cache:
         return _trade_calendar_cache[date_str]
-    # 缓存未命中，实时查询（极少触发）
     try:
         df = pro.trade_cal(exchange='SSE', start_date=date_str, end_date=date_str)
         if df.empty:
@@ -78,14 +77,13 @@ def is_trading_day(dt: date) -> bool:
 def get_next_trading_day(dt: date, direction='next') -> date:
     step = 1 if direction == 'next' else -1
     current = dt + timedelta(days=step)
-    for _ in range(30):  # 防止无限循环
+    for _ in range(30):
         if is_trading_day(current):
             return current
         current += timedelta(days=step)
     raise ValueError(f"无法找到 {direction} 交易日，起始日期 {dt}")
 
 def count_trading_days(start_date: date, end_date: date) -> int:
-    """计算两个日期之间（包含两端）的交易日数量"""
     count = 0
     current = start_date
     while current <= end_date:
@@ -94,6 +92,7 @@ def count_trading_days(start_date: date, end_date: date) -> int:
         current += timedelta(days=1)
     return count
 
+# ========== 价格获取 ==========
 def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=False):
     if isinstance(trade_date, date):
         trade_date = trade_date.strftime('%Y%m%d')
@@ -137,7 +136,7 @@ def get_latest_price(stock_code, price_type='close'):
         print(f"get_latest_price error: {e}")
     return None
 
-# ========== 缓存辅助函数（日线仅开高低收） ==========
+# ========== 日线缓存 ==========
 def _get_cached_daily(stock_code: str, trade_date: date):
     conn = get_db()
     try:
@@ -166,7 +165,7 @@ def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO stock_daily_cache
+                INSERT INTO stock_daily_cache 
                 (stock_code, trade_date, open, close, high, low)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
@@ -182,12 +181,9 @@ def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
         conn.close()
 
 def fetch_stock_daily_info(stock_code: str, trade_date: date):
-    """获取股票日线行情（开高低收），优先缓存，否则 Tushare"""
     cached = _get_cached_daily(stock_code, trade_date)
     if cached:
-        print(f"[日线缓存] 命中 {stock_code} {trade_date}")
         return cached
-
     date_str = trade_date.strftime('%Y%m%d')
     try:
         df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
@@ -239,7 +235,6 @@ def get_stock_name(stock_code: str) -> str:
     cached = _get_cached_name(stock_code)
     if cached:
         return cached
-
     pure_code = stock_code.split('.')[0]
     try:
         df = ak.stock_zh_a_spot_em()
@@ -252,28 +247,59 @@ def get_stock_name(stock_code: str) -> str:
         print(f"[股票名称] 获取失败 {stock_code}: {e}")
     return None
 
-# ========== VWAP 计算（使用 Tushare 日线） ==========
+# ========== 股票市值缓存 ==========
+def get_stock_market_value(stock_code: str, trade_date: date):
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT total_mv FROM stock_market_value_cache WHERE stock_code = %s AND trade_date = %s",
+                (stock_code, trade_date)
+            )
+            row = cursor.fetchone()
+            if row and row['total_mv'] is not None:
+                return float(row['total_mv'])
+    except Exception as e:
+        print(f"[市值缓存读取失败] {e}")
+    finally:
+        conn.close()
+
+    date_str = trade_date.strftime('%Y%m%d')
+    try:
+        df = pro.daily_basic(ts_code=stock_code, trade_date=date_str,
+                             fields='ts_code,trade_date,total_mv,circ_mv')
+        if not df.empty:
+            total_mv = float(df.iloc[0]['total_mv']) * 10000
+            circ_mv = float(df.iloc[0]['circ_mv']) * 10000
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO stock_market_value_cache (stock_code, trade_date, total_mv, circ_mv)
+                        VALUES (%s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv)
+                    """, (stock_code, trade_date, total_mv, circ_mv))
+                conn.commit()
+            finally:
+                conn.close()
+            return total_mv
+    except Exception as e:
+        print(f"[市值获取失败] {stock_code} {trade_date}: {e}")
+    return None
+
+# ========== VWAP ==========
 def get_vwap(stock_code: str, trade_date: date) -> float:
-    """
-    使用 Tushare 日线数据计算 VWAP。
-    Tushare 数据说明:
-        - vol: 成交量，单位是“手” (1手 = 100股)
-        - amount: 成交额，单位是“千元”
-    因此，VWAP (元/股) = (amount * 1000) / (vol * 100)
-    返回 None 表示获取失败。
-    """
     date_str = trade_date.strftime('%Y%m%d')
     try:
         df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
         if df.empty:
             return None
         row = df.iloc[0]
-        amount = float(row['amount'])   # 成交额，单位：千元
-        vol = float(row['vol'])         # 成交量，单位：手
+        amount = float(row['amount'])
+        vol = float(row['vol'])
         if vol == 0:
             return None
-        # 转换为正确的单位并计算
-        vwap = (amount * 1000) / (vol * 100)     # 元/股
+        vwap = (amount * 1000) / (vol * 100)
         return round(vwap, 3)
     except Exception as e:
         print(f"[VWAP] Tushare 获取失败 {stock_code} {date_str}: {e}")
@@ -299,7 +325,7 @@ def calculate_strategy_cash_and_positions(strategy_id):
                 else:
                     cash += amount
             cursor.execute("""
-                SELECT stock_code,
+                SELECT stock_code, 
                        SUM(CASE WHEN action='buy' THEN quantity ELSE -quantity END) as net_qty
                 FROM trades
                 WHERE strategy_id = %s
@@ -339,9 +365,7 @@ def get_current_nav(strategy_id, stock_list=None, price_type='close'):
                 result.append({'stock_code': stock_code, 'nav': nav})
         return result
 
-# ========== 获取策略在指定日期的净值（辅助函数） ==========
 def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='close') -> float:
-    """获取策略在指定日期的收盘净值（含当天已执行的交易）"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -350,8 +374,6 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
             if not row:
                 return None
             initial_capital = float(row['initial_capital'])
-
-            # 获取 target_date 及之前的所有交易
             cursor.execute("""
                 SELECT trade_date, stock_code, action, quantity, price
                 FROM trades
@@ -361,7 +383,6 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
             trades = cursor.fetchall()
     finally:
         conn.close()
-
     cash = initial_capital
     positions = defaultdict(float)
     for t in trades:
@@ -375,8 +396,6 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
             positions[t['stock_code']] -= qty
             if positions[t['stock_code']] == 0:
                 del positions[t['stock_code']]
-
-    # 计算当天持仓市值
     market_value = 0.0
     for stock_code, qty in positions.items():
         price, _ = get_price_from_tushare(stock_code, target_date, price_type, auto_next=True)
@@ -384,52 +403,8 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
             market_value += qty * price
     return cash + market_value
 
-# ========== 股票市值缓存 ==========
-def get_stock_market_value(stock_code: str, trade_date: date):
-    """获取个股总市值，优先读缓存，否则从 Tushare 拉取并缓存"""
-    conn = get_db()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT total_mv FROM stock_market_value_cache WHERE stock_code = %s AND trade_date = %s",
-                (stock_code, trade_date)
-            )
-            row = cursor.fetchone()
-            if row and row['total_mv'] is not None:
-                return float(row['total_mv'])
-    except Exception as e:
-        print(f"[市值缓存读取失败] {e}")
-    finally:
-        conn.close()
-
-    # 从 Tushare daily_basic 获取
-    date_str = trade_date.strftime('%Y%m%d')
-    try:
-        df = pro.daily_basic(ts_code=stock_code, trade_date=date_str,
-                             fields='ts_code,trade_date,total_mv,circ_mv')
-        if not df.empty:
-            total_mv = float(df.iloc[0]['total_mv']) * 10000  # Tushare 单位：万元
-            circ_mv = float(df.iloc[0]['circ_mv']) * 10000
-            # 存入缓存
-            conn = get_db()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO stock_market_value_cache (stock_code, trade_date, total_mv, circ_mv)
-                        VALUES (%s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv)
-                    """, (stock_code, trade_date, total_mv, circ_mv))
-                conn.commit()
-            finally:
-                conn.close()
-            return total_mv
-    except Exception as e:
-        print(f"[市值获取失败] {stock_code} {trade_date}: {e}")
-    return None
-
 # ========== 交易执行 ==========
 def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, target_date):
-    # 1. 获取 VWAP
     vwap = get_vwap(stock_code, target_date)
     if vwap is None:
         conn = get_db()
@@ -441,7 +416,6 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
             conn.close()
         return
 
-    # 2. 获取开盘价
     open_price, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=False)
     if open_price is None:
         conn = get_db()
@@ -453,7 +427,6 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
             conn.close()
         return
 
-    # 3. 涨跌停判断
     up_limit, down_limit = get_limit_price(stock_code, target_date)
     if action == 'buy' and up_limit is not None and open_price >= up_limit - 0.001:
         fail_reason = '涨停无法买入'
@@ -476,7 +449,6 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
             conn.close()
         return
 
-    # 4. 资金/持仓检查
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -527,7 +499,6 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
                 conn.close()
             return
 
-    # 5. 成功：获取日线行情和股票名称
     daily_info = fetch_stock_daily_info(stock_code, target_date)
     stock_name = get_stock_name(stock_code)
 
@@ -588,7 +559,6 @@ def process_pending_orders():
         conn.close()
 
     for order in pending_orders:
-        # 快速检查是否已存在成功交易
         conn = get_db()
         try:
             with conn.cursor() as cursor:
@@ -603,7 +573,6 @@ def process_pending_orders():
                     continue
         finally:
             conn.close()
-
         execute_trade(order['id'], order['strategy_id'], order['stock_code'],
                       order['trade_id'], order['action'], order['quantity'], order['target_date'])
 
@@ -888,51 +857,66 @@ def get_current_nav_endpoint(strategy_id):
     else:
         return jsonify(result)
 
-@app.route('/api/index/sh000300', methods=['GET'])
-def get_index_sh000300():
+@app.route('/api/index/<index_code>', methods=['GET'])
+def get_index_data(index_code):
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
-    price_type = request.args.get('price_type')
-    if not all([start_date_str, end_date_str, price_type]):
-        return jsonify({'error': '缺少必要参数'}), 400
+    price_type = request.args.get('price_type', 'close')
+    if not start_date_str or not end_date_str:
+        return jsonify({'error': '缺少 start_date 或 end_date 参数'}), 400
+    index_map = {
+        'sh000300': '000300.SH',
+        'sh000852': '000852.SH'
+    }
+    ts_code = index_map.get(index_code.lower())
+    if not ts_code:
+        return jsonify({'error': f'不支持的指数代码: {index_code}'}), 400
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-    except:
-        return jsonify({'error': '日期格式错误'}), 400
-    df = pro.index_daily(ts_code='000300.SH',
-                         start_date=start_date.strftime('%Y%m%d'),
-                         end_date=end_date.strftime('%Y%m%d'))
-    if df.empty:
-        return jsonify({'error': '无数据'}), 404
-    df = df.sort_values('trade_date')
-    price_map = {}
-    for _, row in df.iterrows():
-        date_obj = datetime.strptime(row['trade_date'], '%Y%m%d').date()
-        price_map[date_obj] = float(row[price_type])
-    dates = []
-    current = start_date
-    while current <= end_date:
-        dates.append(current)
-        current += timedelta(days=1)
-    base_price = None
-    result = []
-    last_price = None
-    for d in dates:
-        if d in price_map:
-            price = price_map[d]
-            last_price = price
-        else:
-            price = last_price
-        if price is None:
-            continue
-        if base_price is None:
-            base_price = price
-            relative = 100.0
-        else:
-            relative = (price / base_price) * 100
-        result.append({'date': d.strftime('%Y-%m-%d'), 'value': price, 'percent_change': round(relative, 2)})
-    return jsonify(result)
+    except ValueError:
+        return jsonify({'error': '日期格式错误，应为 YYYY-MM-DD'}), 400
+    try:
+        df = pro.index_daily(ts_code=ts_code,
+                             start_date=start_date.strftime('%Y%m%d'),
+                             end_date=end_date.strftime('%Y%m%d'))
+        if df.empty:
+            return jsonify({'error': f'指数 {index_code} 在指定区间无数据'}), 404
+        df = df.sort_values('trade_date')
+        price_map = {}
+        for _, row in df.iterrows():
+            date_obj = datetime.strptime(row['trade_date'], '%Y%m%d').date()
+            price_map[date_obj] = float(row[price_type])
+        dates = []
+        current = start_date
+        while current <= end_date:
+            dates.append(current)
+            current += timedelta(days=1)
+        base_price = None
+        last_price = None
+        result = []
+        for d in dates:
+            if d in price_map:
+                price = price_map[d]
+                last_price = price
+            else:
+                price = last_price
+            if price is None:
+                continue
+            if base_price is None:
+                base_price = price
+                relative = 100.0
+            else:
+                relative = (price / base_price) * 100
+            result.append({
+                'date': d.strftime('%Y-%m-%d'),
+                'value': round(price, 2),
+                'percent_change': round(relative, 2)
+            })
+        return jsonify(result)
+    except Exception as e:
+        print(f"[指数数据获取失败] {index_code}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
@@ -1021,7 +1005,6 @@ def get_strategy_holdings_at_date(strategy_id):
         total_mv_close += mv_close
         batches_detail = []
         for batch in stock_batches[stock_code]:
-            # 使用交易日计数函数计算实际持股天数
             holding_days = count_trading_days(batch['buy_date'], display_date)
             batches_detail.append([batch['quantity'], holding_days])
         holdings_list.append({
@@ -1128,10 +1111,8 @@ def delete_strategy(strategy_id):
     finally:
         conn.close()
 
-# ========== 新增：策略回报分析接口 ==========
 @app.route('/api/strategies/<strategy_id>/returns', methods=['GET'])
 def get_strategy_returns(strategy_id):
-    """获取策略各交易组的回报数据"""
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
     if not start_date_str or not end_date_str:
@@ -1145,7 +1126,6 @@ def get_strategy_returns(strategy_id):
     conn = get_db()
     try:
         with conn.cursor() as cursor:
-            # 获取该策略区间内所有买入交易，按交易日分组
             cursor.execute("""
                 SELECT trade_date, stock_code, quantity, price, amount
                 FROM trades
@@ -1160,16 +1140,14 @@ def get_strategy_returns(strategy_id):
     if not trades:
         return jsonify([])
 
-    # 按交易日分组
     groups = defaultdict(list)
     for t in trades:
         groups[t['trade_date']].append(t)
 
     result = []
     for trade_date, group_trades in groups.items():
-        # 计算买入总金额和个股成本、数量
         total_cost = 0.0
-        stock_info = []  # (stock_code, qty, price, cost)
+        stock_info = []
         for t in group_trades:
             qty = float(t['quantity'])
             price = float(t['price'])
@@ -1182,11 +1160,9 @@ def get_strategy_returns(strategy_id):
                 'cost': cost
             })
 
-        # 获取前一交易日策略净值用于计算换手率
         prev_trade_date = get_next_trading_day(trade_date, 'prev')
         prev_nav = get_strategy_nav_at_date(strategy_id, prev_trade_date, 'close')
         if prev_nav is None:
-            # 若无前一交易日，用初始资金
             conn = get_db()
             with conn.cursor() as cursor:
                 cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
@@ -1194,7 +1170,6 @@ def get_strategy_returns(strategy_id):
             conn.close()
         turnover = total_cost / prev_nav if prev_nav > 0 else 0.0
 
-        # 获取各股票买入当日的总市值，用于计算 Holding_Size_Mean/Median
         mv_list = []
         weighted_mv_sum = 0.0
         for info in stock_info:
@@ -1205,7 +1180,6 @@ def get_strategy_returns(strategy_id):
             else:
                 mv_list.append(None)
 
-        # 计算均值和中位数（忽略 None）
         valid_mvs = [m for m in mv_list if m is not None]
         holding_size_mean = weighted_mv_sum / total_cost if total_cost > 0 and valid_mvs else None
         holding_size_median = None
@@ -1217,31 +1191,25 @@ def get_strategy_returns(strategy_id):
             else:
                 holding_size_median = (sorted_mvs[n // 2 - 1] + sorted_mvs[n // 2]) / 2
 
-        # 计算 T1~T5 收益率
         returns = {}
         for offset in range(1, 6):
             target_d = trade_date
             for _ in range(offset):
                 target_d = get_next_trading_day(target_d, 'next')
-            # 计算该日组合市值
             mv = 0.0
             for info in stock_info:
                 price, _ = get_price_from_tushare(info['stock_code'], target_d, 'close', auto_next=True)
                 if price:
                     mv += info['quantity'] * price
-            if total_cost > 0:
-                returns[f'T{offset}'] = (mv / total_cost) - 1
-            else:
-                returns[f'T{offset}'] = None
+            returns[f'T{offset}'] = (mv / total_cost - 1) if total_cost > 0 else None
 
-        # 构建交易组构成字符串，用于前端展示
         comp_list = [(info['stock_code'], info['quantity']) for info in stock_info]
         comp_str = '[' + ', '.join([f"({code},{qty})" for code, qty in comp_list]) + ']'
 
         result.append({
             'date': trade_date.strftime('%Y-%m-%d'),
             'composition': comp_str,
-            'composition_detail': comp_list,  # 用于展开详情
+            'composition_detail': comp_list,
             'holding_sum': sum(info['quantity'] for info in stock_info),
             'Holding_Size_Mean': round(holding_size_mean, 2) if holding_size_mean is not None else None,
             'Holding_Size_Median': round(holding_size_median, 2) if holding_size_median is not None else None,
@@ -1250,18 +1218,18 @@ def get_strategy_returns(strategy_id):
             'T3_Return': round(returns['T3'] * 100, 2) if returns['T3'] is not None else None,
             'T4_Return': round(returns['T4'] * 100, 2) if returns['T4'] is not None else None,
             'T5_Return': round(returns['T5'] * 100, 2) if returns['T5'] is not None else None,
-            'turnover': round(turnover * 100, 2)  # 百分比
+            'turnover': round(turnover * 100, 2)
         })
 
     return jsonify(result)
 
-# ========== 启动调度器 ==========
+# ========== 启动调度器与加载交易日历 ==========
+load_trade_calendar()
+
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
-    # 启动时预加载交易日历
-    load_trade_calendar()
     app.run(host='0.0.0.0', port=5000, debug=True)
