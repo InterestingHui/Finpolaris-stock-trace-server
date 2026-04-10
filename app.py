@@ -6,7 +6,6 @@ import pymysql
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import tushare as ts
-import akshare as ak
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import logging
@@ -202,7 +201,7 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
         print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
 
-# ========== 股票名称缓存 ==========
+# ========== 股票名称缓存（基于 Tushare） ==========
 def _get_cached_name(stock_code: str):
     conn = get_db()
     try:
@@ -230,22 +229,40 @@ def _save_cached_name(stock_code: str, stock_name: str):
     finally:
         conn.close()
 
+def init_stock_basic_cache():
+    """启动时从 Tushare 拉取全量股票基本信息，写入数据库缓存"""
+    print("[股票名称] 开始从 Tushare 初始化股票基本信息...")
+    try:
+        # 获取所有上市状态的股票基本信息（包含名称）
+        df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
+        if df.empty:
+            print("[股票名称] Tushare 未返回数据")
+            return
+
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        INSERT INTO stock_name_cache (stock_code, stock_name)
+                        VALUES (%s, %s)
+                        ON DUPLICATE KEY UPDATE stock_name = VALUES(stock_name)
+                    """, (row['ts_code'], row['name']))
+            conn.commit()
+            print(f"[股票名称] 成功缓存 {len(df)} 只股票名称")
+        except Exception as e:
+            conn.rollback()
+            print(f"[股票名称] 数据库写入失败: {e}")
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[股票名称] Tushare 获取失败: {e}")
+
 @lru_cache(maxsize=5000)
 def get_stock_name(stock_code: str) -> str:
+    """从数据库缓存获取股票名称（启动时已预加载）"""
     cached = _get_cached_name(stock_code)
-    if cached:
-        return cached
-    pure_code = stock_code.split('.')[0]
-    try:
-        df = ak.stock_zh_a_spot_em()
-        row = df[df['代码'] == pure_code]
-        if not row.empty:
-            name = row.iloc[0]['名称']
-            _save_cached_name(stock_code, name)
-            return name
-    except Exception as e:
-        print(f"[股票名称] 获取失败 {stock_code}: {e}")
-    return None
+    return cached if cached else None
 
 # ========== 股票市值缓存 ==========
 def get_stock_market_value(stock_code: str, trade_date: date):
@@ -1223,9 +1240,13 @@ def get_strategy_returns(strategy_id):
 
     return jsonify(result)
 
-# ========== 启动调度器与加载交易日历 ==========
+# ========== 启动初始化 ==========
+# 加载交易日历
 load_trade_calendar()
+# 初始化股票名称缓存（基于 Tushare）
+init_stock_basic_cache()
 
+# 启动调度器
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
 scheduler.start()
