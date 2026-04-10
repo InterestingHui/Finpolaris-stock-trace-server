@@ -233,7 +233,6 @@ def init_stock_basic_cache():
     """启动时从 Tushare 拉取全量股票基本信息，写入数据库缓存"""
     print("[股票名称] 开始从 Tushare 初始化股票基本信息...")
     try:
-        # 获取所有上市状态的股票基本信息（包含名称）
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
         if df.empty:
             print("[股票名称] Tushare 未返回数据")
@@ -1208,6 +1207,15 @@ def get_strategy_returns(strategy_id):
             else:
                 holding_size_median = (sorted_mvs[n // 2 - 1] + sorted_mvs[n // 2]) / 2
 
+        # 计算 T0 收益率（当日收盘市值相对成本）
+        mv_t0 = 0.0
+        for info in stock_info:
+            price_t0, _ = get_price_from_tushare(info['stock_code'], trade_date, 'close', auto_next=True)
+            if price_t0:
+                mv_t0 += info['quantity'] * price_t0
+        t0_return = (mv_t0 / total_cost - 1) if total_cost > 0 else None
+
+        # 计算 T1~T5 收益率
         returns = {}
         for offset in range(1, 6):
             target_d = trade_date
@@ -1230,6 +1238,7 @@ def get_strategy_returns(strategy_id):
             'holding_sum': sum(info['quantity'] for info in stock_info),
             'Holding_Size_Mean': round(holding_size_mean, 2) if holding_size_mean is not None else None,
             'Holding_Size_Median': round(holding_size_median, 2) if holding_size_median is not None else None,
+            'T0_Return': round(t0_return * 100, 2) if t0_return is not None else None,
             'T1_Return': round(returns['T1'] * 100, 2) if returns['T1'] is not None else None,
             'T2_Return': round(returns['T2'] * 100, 2) if returns['T2'] is not None else None,
             'T3_Return': round(returns['T3'] * 100, 2) if returns['T3'] is not None else None,
