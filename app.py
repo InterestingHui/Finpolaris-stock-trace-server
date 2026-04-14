@@ -6,10 +6,14 @@ import pymysql
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import tushare as ts
+import akshare as ak
+import pandas as pd
+import baostock as bs
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import logging
 from functools import lru_cache
+import random
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
@@ -201,6 +205,78 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
         print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
 
+# ========== 指数数据缓存 ==========
+_index_cache = {}  # 缓存指数数据，格式: {(index_code, start_date, end_date, price_type): data}
+
+def get_index_data_cached(index_code: str, start_date: date, end_date: date, price_type: str):
+    """从缓存或 API 获取指数数据"""
+    cache_key = (index_code, start_date, end_date, price_type)
+
+    # 检查缓存
+    if cache_key in _index_cache:
+        return _index_cache[cache_key]
+
+    # 从 Tushare 获取
+    index_map = {
+        'sh000300': '000300.SH',
+        'sh000852': '000852.SH'
+    }
+    ts_code = index_map.get(index_code.lower())
+    if not ts_code:
+        return None
+
+    try:
+        df = pro.index_daily(
+            ts_code=ts_code,
+            start_date=start_date.strftime('%Y%m%d'),
+            end_date=end_date.strftime('%Y%m%d')
+        )
+
+        if df.empty:
+            return None
+
+        df = df.sort_values('trade_date')
+        price_map = {}
+        for _, row in df.iterrows():
+            date_obj = datetime.strptime(row['trade_date'], '%Y%m%d').date()
+            price_map[date_obj] = float(row[price_type])
+
+        dates = []
+        current = start_date
+        while current <= end_date:
+            dates.append(current)
+            current += timedelta(days=1)
+
+        base_price = None
+        last_price = None
+        result = []
+        for d in dates:
+            if d in price_map:
+                price = price_map[d]
+                last_price = price
+            else:
+                price = last_price
+            if price is None:
+                continue
+            if base_price is None:
+                base_price = price
+                relative = 100.0
+            else:
+                relative = (price / base_price) * 100
+            result.append({
+                'date': d.strftime('%Y-%m-%d'),
+                'value': round(price, 2),
+                'percent_change': round(relative, 2)
+            })
+
+        # 缓存结果
+        _index_cache[cache_key] = result
+        return result
+
+    except Exception as e:
+        print(f"[指数数据获取失败] {index_code}: {e}")
+        return None
+
 # ========== 股票名称缓存（基于 Tushare） ==========
 def _get_cached_name(stock_code: str):
     conn = get_db()
@@ -321,6 +397,149 @@ def get_vwap(stock_code: str, trade_date: date) -> float:
         print(f"[VWAP] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
 
+# ========== 分钟级价格缓存 ==========
+stock_min_cache = {}
+
+def is_minute_data_available(target_datetime: datetime) -> bool:
+    """检查分钟数据是否可用（BaoStock 支持 5 年）"""
+    days_diff = (datetime.now().date() - target_datetime.date()).days
+    return days_diff <= 1825  # 5 年
+
+def get_minute_price(stock_code: str, target_datetime: datetime) -> dict:
+    """获取指定分钟的股票价格（使用 BaoStock）"""
+    cache_key = (stock_code, target_datetime)
+    if cache_key in stock_min_cache:
+        return stock_min_cache[cache_key]
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT open_price, close_price, high_price, low_price, volume, amount
+                   FROM stock_min_cache WHERE stock_code = %s AND trade_datetime = %s""",
+                (stock_code, target_datetime)
+            )
+            result = cursor.fetchone()
+            if result:
+                price_data = {
+                    'open': float(result['open_price']), 'close': float(result['close_price']),
+                    'high': float(result['high_price']), 'low': float(result['low_price']),
+                    'volume': result['volume'], 'amount': result['amount']
+                }
+                stock_min_cache[cache_key] = price_data
+                return price_data
+    except Exception as e:
+        print(f"[缓存查询错误] {e}")
+    finally:
+        conn.close()
+
+    if not is_minute_data_available(target_datetime):
+        return None
+
+    try:
+        code_only = stock_code.split('.')[0]
+        bs_code = f'sz.{code_only}' if 'SZ' in stock_code else f'sh.{code_only}'
+        date_str = target_datetime.strftime('%Y-%m-%d')
+
+        lg = bs.login()
+        if lg.error_code != '0':
+            return None
+
+        rs = bs.query_history_k_data_plus(
+            code=bs_code,
+            fields="date,time,open,high,low,close,volume,amount",
+            start_date=date_str,
+            end_date=date_str,
+            frequency="5",  # 5分钟线（BaoStock 1分钟线受限）
+            adjustflag="1"
+        )
+
+        if rs.error_code != '0' or len(rs.data) == 0:
+            bs.logout()
+            return None
+
+        df = pd.DataFrame(rs.data, columns=rs.fields)
+
+        # 修复BaoStock时间格式解析：YYYYMMDDHHmmss
+        def parse_baostock_datetime(date_str, time_str):
+            if len(time_str) >= 14:
+                year = time_str[0:4]
+                month = time_str[4:6]
+                day = time_str[6:8]
+                hour = time_str[8:10]
+                minute = time_str[10:12]
+                second = time_str[12:14] if len(time_str) >= 14 else '00'
+                return f"{year}-{month}-{day} {hour}:{minute}:{second}"
+            return f"{date_str} {time_str}"
+
+        df['datetime'] = df.apply(lambda row: parse_baostock_datetime(row['date'], row['time']), axis=1)
+        df['datetime'] = pd.to_datetime(df['datetime'], format='%Y-%m-%d %H:%M:%S')
+
+        # 找精确匹配的目标分钟
+        target_minute = target_datetime.replace(second=0, microsecond=0)
+        exact_match = df[df['datetime'] == target_minute]
+
+        if len(exact_match) > 0:
+            row = exact_match.iloc[0]
+        else:
+            # 如果没有精确匹配，找最接近的（5分钟线容错范围扩大）
+            df['diff'] = abs(df['datetime'] - target_minute)
+            row = df.loc[df['diff'].idxmin()]
+            if row['diff'].total_seconds() > 150:  # 5分钟线容错范围：2.5分钟
+                bs.logout()
+                return None
+
+        # BaoStock价格字段不是实际价格，需要用成交额/成交量重新计算
+        # 价格单位：元/股
+        volume = int(row['volume'])
+        amount = float(row['amount'])
+        actual_close = amount / volume if volume > 0 else 0
+
+        # 使用成交额/成交量计算实际价格，其他价格用比例估算
+        price_ratio = actual_close / float(row['close'])
+
+        price_data = {
+            'open': float(row['open']) * price_ratio,
+            'close': actual_close,
+            'high': float(row['high']) * price_ratio,
+            'low': float(row['low']) * price_ratio,
+            'volume': volume,
+            'amount': amount
+        }
+
+        bs.logout()
+        stock_min_cache[cache_key] = price_data
+
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO stock_min_cache
+                       (stock_code, trade_datetime, open_price, close_price,
+                        high_price, low_price, volume, amount)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON DUPLICATE KEY UPDATE
+                       open_price = VALUES(open_price), close_price = VALUES(close_price),
+                       high_price = VALUES(high_price), low_price = VALUES(low_price),
+                       volume = VALUES(volume), amount = VALUES(amount)""",
+                    (stock_code, target_datetime, price_data['open'], price_data['close'],
+                     price_data['high'], price_data['low'], price_data['volume'], price_data['amount'])
+                )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+        finally:
+            conn.close()
+
+        return price_data
+
+    except Exception as e:
+        try:
+            bs.logout()
+        except:
+            pass
+        return None
+
 # ========== 策略计算 ==========
 def calculate_strategy_cash_and_positions(strategy_id):
     conn = get_db()
@@ -420,58 +639,201 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
     return cash + market_value
 
 # ========== 交易执行 ==========
-def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, target_date):
-    vwap = get_vwap(stock_code, target_date)
-    if vwap is None:
+def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
+                  target_datetime, order_type='daily_order', limit_price=None, cutoff_time=None):
+    """
+    执行交易订单
+
+    Args:
+        log_id: 交易日志 ID
+        strategy_id: 策略 ID
+        stock_code: 股票代码
+        trade_id: 交易 ID
+        action: 'buy' 或 'sell'
+        quantity: 交易数量
+        target_datetime: 目标执行时间（精确到分钟）
+        order_type: 订单类型（daily_order/limit_order/market_order）
+        limit_price: 限价单价格
+        cutoff_time: 限价单截止时间
+    """
+    print(f"[DEBUG] execute_trade 开始: trade_id={trade_id}, action={action}, order_type={order_type}, target_datetime={target_datetime}")
+    target_date = target_datetime.date() if isinstance(target_datetime, datetime) else target_datetime
+
+    # 根据订单类型获取成交价
+    actual_price = None
+    vwap_price = None
+    price_type = 'vwap'
+
+    if order_type == 'daily_order':
+        # 日度单：使用 VWAP
+        vwap_price = get_vwap(stock_code, target_date)
+        actual_price = vwap_price
+        price_type = 'vwap'
+
+    elif order_type == 'market_order':
+        minute_data = get_minute_price(stock_code, target_datetime)
+        if minute_data is None:
+            vwap_price = get_vwap(stock_code, target_date)
+            actual_price = vwap_price
+            price_type = 'vwap'
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("UPDATE trade_logs SET fail_reason = %s WHERE id = %s",
+                                 ("分钟数据不可用，已回退到 VWAP", log_id))
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            actual_price = minute_data['close']
+            vwap_price = get_vwap(stock_code, target_date)
+            price_type = 'actual'
+
+    elif order_type == 'limit_order':
+        # 限价单：检查价格是否满足条件
+        if limit_price is None:
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                        ("限价单缺少价格参数", log_id)
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return False
+
+        minute_data = get_minute_price(stock_code, target_datetime)
+        if minute_data is None:
+            # 分钟数据不可用，无法执行限价单
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                        ("分钟数据不可用，限价单无法执行", log_id)
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return False
+
+        # 检查价格是否满足限价条件
+        if action == 'buy':
+            # 买入：价格必须 ≤ 限价
+            if minute_data['close'] <= limit_price:
+                actual_price = minute_data['close']  # 以实际价格成交
+                price_type = 'actual'
+            else:
+                conn = get_db()
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                            (f"价格 {minute_data['close']} 超过限价 {limit_price}", log_id)
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                return False
+        else:  # sell
+            # 卖出：价格必须 ≥ 限价
+            if minute_data['close'] >= limit_price:
+                actual_price = minute_data['close']  # 以实际价格成交
+                price_type = 'actual'
+            else:
+                conn = get_db()
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                            (f"价格 {minute_data['close']} 低于限价 {limit_price}", log_id)
+                        )
+                        conn.commit()
+                finally:
+                    conn.close()
+                return False
+
+        vwap_price = get_vwap(stock_code, target_date)
+    else:
         conn = get_db()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("UPDATE trade_logs SET status='failed', fail_reason='停牌或无数据', actual_date=%s WHERE id=%s", (target_date, log_id))
+                cursor.execute(
+                    "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                    (f"不支持的订单类型: {order_type}", log_id)
+                )
             conn.commit()
         finally:
             conn.close()
-        return
+        return False
 
+    if actual_price is None:
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE trade_logs SET status = 'failed', fail_reason = %s WHERE id = %s",
+                    ("无法获取成交价", log_id)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return False
+
+    # 获取开盘价用于涨跌停检查
     open_price, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=False)
     if open_price is None:
         conn = get_db()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("UPDATE trade_logs SET status='failed', fail_reason='无法获取开盘价', actual_date=%s WHERE id=%s", (target_date, log_id))
+                cursor.execute(
+                    "UPDATE trade_logs SET status='failed', fail_reason='无法获取开盘价', actual_date=%s WHERE id=%s",
+                    (target_datetime, log_id)
+                )
             conn.commit()
         finally:
             conn.close()
-        return
+        return False
 
+    # 涨跌停检查
     up_limit, down_limit = get_limit_price(stock_code, target_date)
     if action == 'buy' and up_limit is not None and open_price >= up_limit - 0.001:
         fail_reason = '涨停无法买入'
         conn = get_db()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s", (fail_reason, target_date, vwap, log_id))
+                cursor.execute(
+                    "UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s",
+                    (fail_reason, target_datetime, actual_price, log_id)
+                )
             conn.commit()
         finally:
             conn.close()
-        return
+        return False
     if action == 'sell' and down_limit is not None and open_price <= down_limit + 0.001:
         fail_reason = '跌停无法卖出'
         conn = get_db()
         try:
             with conn.cursor() as cursor:
-                cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s", (fail_reason, target_date, vwap, log_id))
+                cursor.execute(
+                    "UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s",
+                    (fail_reason, target_datetime, actual_price, log_id)
+                )
             conn.commit()
         finally:
             conn.close()
-        return
+        return False
 
+    # 资金/持仓检查
     conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id=%s", (strategy_id,))
             row = cursor.fetchone()
             if not row:
-                return
+                return False
             initial_capital = float(row['initial_capital'])
             cursor.execute("SELECT action, amount FROM trades WHERE strategy_id = %s", (strategy_id,))
             trades = cursor.fetchall()
@@ -491,17 +853,20 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
         conn.close()
 
     if action == 'buy':
-        cost = quantity * vwap
+        cost = quantity * actual_price
         if cash < cost:
             fail_reason = '资金不足'
             conn = get_db()
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s", (fail_reason, target_date, vwap, log_id))
+                    cursor.execute(
+                        "UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s",
+                        (fail_reason, target_datetime, actual_price, log_id)
+                    )
                 conn.commit()
             finally:
                 conn.close()
-            return
+            return False
     else:
         current_qty = positions.get(stock_code, 0)
         if current_qty < quantity:
@@ -509,21 +874,28 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
             conn = get_db()
             try:
                 with conn.cursor() as cursor:
-                    cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s", (fail_reason, target_date, vwap, log_id))
+                    cursor.execute(
+                        "UPDATE trade_logs SET status='failed', fail_reason=%s, actual_date=%s, price=%s WHERE id=%s",
+                        (fail_reason, target_datetime, actual_price, log_id)
+                    )
                 conn.commit()
             finally:
                 conn.close()
-            return
+            return False
 
+    # 获取日线信息
     daily_info = fetch_stock_daily_info(stock_code, target_date)
     stock_name = get_stock_name(stock_code)
 
     update_fields = {
         'status': 'success',
-        'actual_date': target_date,
-        'price': vwap,
-        'vwap': vwap,
+        'actual_date': target_datetime,
+        'price': actual_price,
+        'vwap': vwap_price,
+        'actual_price': actual_price,
+        'order_type': order_type,
         'stock_name': stock_name,
+        'fail_reason': None,  # 清除之前的错误信息
     }
     if daily_info:
         update_fields.update({
@@ -537,38 +909,52 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity, t
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO trades (strategy_id, stock_code, trade_id, trade_date, action, quantity, price, price_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'vwap')
-            """, (strategy_id, stock_code, trade_id, target_date, action, quantity, vwap))
+                INSERT INTO trades (strategy_id, stock_code, trade_id, trade_date, action, quantity, price, price_type, order_type, limit_price, cutoff_time, actual_price)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (strategy_id, stock_code, trade_id, target_datetime, action, quantity,
+                  actual_price, price_type, order_type, limit_price, cutoff_time, actual_price))
             set_clause = ', '.join([f"{k}=%s" for k in update_fields.keys()])
             values = list(update_fields.values()) + [log_id]
             cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
         conn.commit()
-        print(f"[INFO] 交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{vwap}")
+        print(f"[INFO] 交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{actual_price} ({order_type})")
     except pymysql.err.IntegrityError as e:
         conn.rollback()
         print(f"[WARN] 唯一约束冲突，交易已存在，忽略本次重复执行: {e}")
         with conn.cursor() as cursor:
-            cursor.execute("UPDATE trade_logs SET status='success', actual_date=%s WHERE id=%s", (target_date, log_id))
+            cursor.execute(
+                "UPDATE trade_logs SET status='success', actual_date=%s, fail_reason=NULL WHERE id=%s",
+                (target_datetime, log_id)
+            )
         conn.commit()
     except Exception as e:
         conn.rollback()
         print(f"[ERROR] 交易执行失败: {e}")
         with conn.cursor() as cursor:
-            cursor.execute("UPDATE trade_logs SET status='failed', fail_reason=%s WHERE id=%s", (str(e)[:255], log_id))
+            cursor.execute(
+                "UPDATE trade_logs SET status='failed', fail_reason=%s WHERE id=%s",
+                (str(e)[:255], log_id)
+            )
         conn.commit()
     finally:
         conn.close()
 
+    return True
+
 def process_pending_orders():
+    """
+    处理待成交订单（非限价单：日度单、市价单）
+    """
     conn = get_db()
     try:
         with conn.cursor() as cursor:
-            today = date.today()
+            today = datetime.now()
             cursor.execute("""
-                SELECT id, strategy_id, stock_code, trade_id, action, quantity, target_date
+                SELECT id, strategy_id, stock_code, trade_id, action, quantity,
+                       target_date, order_type
                 FROM trade_logs
                 WHERE status='pending' AND target_date <= %s
+                  AND order_type IN ('daily_order', 'market_order')
             """, (today,))
             pending_orders = cursor.fetchall()
     finally:
@@ -590,7 +976,232 @@ def process_pending_orders():
         finally:
             conn.close()
         execute_trade(order['id'], order['strategy_id'], order['stock_code'],
-                      order['trade_id'], order['action'], order['quantity'], order['target_date'])
+                      order['trade_id'], order['action'], order['quantity'],
+                      order['target_date'], order['order_type'])
+
+def process_limit_orders():
+    """
+    处理限价单：模拟持续监控价格
+    对于回测系统，在目标时间和截止时间之间查找第一个满足条件的时间点
+    """
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            # 查询待处理的限价单，按时间顺序处理
+            cursor.execute(
+                """SELECT id, strategy_id, stock_code, trade_id, action, quantity,
+                          target_date, limit_price, cutoff_time
+                   FROM trade_logs
+                   WHERE status = 'pending'
+                     AND order_type = 'limit_order'
+                     AND target_date <= NOW()
+                   ORDER BY target_date ASC"""
+            )
+
+            pending_orders = cursor.fetchall()
+    finally:
+        conn.close()
+
+    print(f"[DEBUG] process_limit_orders 查询到 {len(pending_orders)} 个待处理限价单")
+
+    for order in pending_orders:
+        log_id = order['id']
+        strategy_id = order['strategy_id']
+        stock_code = order['stock_code']
+        trade_id = order['trade_id']
+        action = order['action']
+        quantity = order['quantity']
+        target_datetime = order['target_date']
+        limit_price = order['limit_price']
+        cutoff_time = order['cutoff_time']
+
+        print(f"[DEBUG] 处理限价单: trade_id={trade_id}, target_datetime={target_datetime}, limit_price={limit_price}, cutoff_time={cutoff_time}")
+
+        # 获取该日期的5分钟K线数据
+        date_str = target_datetime.date().strftime('%Y-%m-%d')
+        day_minute_data = get_day_minute_data(stock_code, date_str)
+
+        if not day_minute_data:
+            print(f"[DEBUG] 无法获取 {date_str} 的分钟数据")
+            continue
+
+        # 在目标时间到截止时间之间查找满足条件的时间点
+        filled = False
+        fill_time = None
+        fill_price = None
+
+        for minute_time, price_data in day_minute_data:
+            if minute_time < target_datetime:
+                continue  # 跳过目标时间之前的时间点
+
+            if cutoff_time and minute_time > cutoff_time:
+                break  # 超过截止时间
+
+            actual_price = price_data['close']
+            price_satisfied = False
+
+            if action == 'buy':
+                # 买入：价格必须 ≤ 限价
+                if actual_price <= limit_price:
+                    price_satisfied = True
+            else:  # sell
+                # 卖出：价格必须 ≥ 限价
+                if actual_price >= limit_price:
+                    price_satisfied = True
+
+            if price_satisfied:
+                filled = True
+                fill_time = minute_time
+                fill_price = actual_price
+                print(f"[DEBUG] 找到满足条件的时间点: {fill_time}, 价格: {fill_price:.3f}")
+                break
+
+        if filled:
+            # 在找到的时间点执行交易
+            execute_limit_order_fill(
+                log_id, strategy_id, stock_code, trade_id, action, quantity,
+                fill_time, fill_price, limit_price
+            )
+        else:
+            # 没有找到满足条件的时间点
+            print(f"[DEBUG] 限价单未找到满足条件的时间点，标记为失败")
+            conn = get_db()
+            try:
+                with conn.cursor() as cursor:
+                    # 获取目标时间的价格用于失败原因
+                    target_price = None
+                    for minute_time, price_data in day_minute_data:
+                        if minute_time == target_datetime:
+                            target_price = price_data['close']
+                            break
+
+                    fail_reason = f"未找到满足条件的成交时间。目标时间价格: {target_price:.3f}"
+                    cursor.execute(
+                        "UPDATE trade_logs SET status = 'failed', fail_reason = %s, actual_date = %s WHERE id = %s",
+                        (fail_reason, target_datetime, log_id)
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+
+def get_day_minute_data(stock_code: str, date_str: str) -> list:
+    """获取一天的5分钟K线数据，返回 [(datetime, price_data), ...]"""
+    import baostock as bs
+    import pandas as pd
+
+    code_only = stock_code.split('.')[0]
+    bs_code = f'sz.{code_only}' if 'SZ' in stock_code else f'sh.{code_only}'
+
+    lg = bs.login()
+    if lg.error_code != '0':
+        print(f"[DEBUG] BaoStock登录失败: {lg.error_msg}")
+        bs.logout()
+        return None
+
+    rs = bs.query_history_k_data_plus(
+        code=bs_code,
+        fields="date,time,open,high,low,close,volume,amount",
+        start_date=date_str,
+        end_date=date_str,
+        frequency="5",
+        adjustflag="1"
+    )
+
+    if rs.error_code != '0' or len(rs.data) == 0:
+        bs.logout()
+        return None
+
+    df = pd.DataFrame(rs.data, columns=rs.fields)
+
+    # 解析时间
+    def parse_baostock_datetime(date_str, time_str):
+        if len(time_str) >= 14:
+            year = time_str[0:4]
+            month = time_str[4:6]
+            day = time_str[6:8]
+            hour = time_str[8:10]
+            minute = time_str[10:12]
+            second = time_str[12:14] if len(time_str) >= 14 else '00'
+            return f"{year}-{month}-{day} {hour}:{minute}:{second}"
+        return f"{date_str} {time_str}"
+
+    df['datetime'] = df.apply(lambda row: parse_baostock_datetime(row['date'], row['time']), axis=1)
+    df['datetime'] = pd.to_datetime(df['datetime'], format='%Y-%m-%d %H:%M:%S')
+
+    # 处理价格数据
+    result = []
+    for _, row in df.iterrows():
+        volume = int(row['volume'])
+        amount = float(row['amount'])
+        actual_close = amount / volume if volume > 0 else 0
+        price_ratio = actual_close / float(row['close'])
+
+        price_data = {
+            'open': float(row['open']) * price_ratio,
+            'close': actual_close,
+            'high': float(row['high']) * price_ratio,
+            'low': float(row['low']) * price_ratio,
+            'volume': volume,
+            'amount': amount
+        }
+        result.append((row['datetime'], price_data))
+
+    bs.logout()
+    return result
+
+def execute_limit_order_fill(log_id, strategy_id, stock_code, trade_id, action, quantity,
+                             fill_time, fill_price, limit_price):
+    """执行限价单成交"""
+    try:
+        # 获取VWAP
+        vwap_price = get_vwap(stock_code, fill_time.date())
+
+        # 获取日线信息
+        daily_info = fetch_stock_daily_info(stock_code, fill_time.date())
+        stock_name = get_stock_name(stock_code)
+
+        update_fields = {
+            'status': 'success',
+            'actual_date': fill_time,
+            'price': fill_price,
+            'vwap': vwap_price,
+            'actual_price': fill_price,
+            'order_type': 'limit_order',
+            'stock_name': stock_name,
+            'fail_reason': None,
+        }
+        if daily_info:
+            update_fields.update({
+                'open_price': daily_info['open'],
+                'close_price': daily_info['close'],
+                'high_price': daily_info['high'],
+                'low_price': daily_info['low']
+            })
+
+        conn = get_db()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO trades (strategy_id, stock_code, trade_id, trade_date, action, quantity, price, price_type, order_type, limit_price, cutoff_time, actual_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (strategy_id, stock_code, trade_id, fill_time, action, quantity,
+                          fill_price, 'actual', 'limit_order', limit_price, None, fill_price))
+                set_clause = ', '.join([f"{k}=%s" for k in update_fields.keys()])
+                values = list(update_fields.values()) + [log_id]
+                cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
+            conn.commit()
+            print(f"[INFO] 限价单成交: {strategy_id} trade_id={trade_id} {action} {quantity}@{fill_price:.3f} @ {fill_time}")
+        except pymysql.err.IntegrityError as e:
+            conn.rollback()
+            print(f"[WARN] 限价单已存在: {e}")
+        except Exception as e:
+            conn.rollback()
+            print(f"[ERROR] 限价单执行失败: {e}")
+        finally:
+            conn.close()
+
+    except Exception as e:
+        print(f"[ERROR] execute_limit_order_fill 失败: {e}")
 
 # ========== 路由 ==========
 @app.route('/')
@@ -625,13 +1236,34 @@ def add_strategies():
                                    (strategy_id, initial_capital))
 
             stocks = strategy.get('stocks', [])
+
+            # 收集当前策略中已有的 trade_id，用于去重
+            used_trade_ids = set()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT trade_id FROM trade_logs WHERE strategy_id = %s", (strategy_id,))
+                for row in cursor.fetchall():
+                    used_trade_ids.add(row['trade_id'])
+
             for item in stocks:
                 stock_code = item.get('stock_code')
                 trade_id = item.get('trade_id')
                 action = item.get('action')
                 quantity = item.get('quantity')
-                if not all([stock_code, trade_id, action, quantity]):
-                    return jsonify({'error': '股票交易信息不完整，必须包含 trade_id'}), 400
+                date_input = item.get('date')
+                order_type = item.get('order_type', 'daily_order')
+                limit_price = item.get('limit_price')
+                cutoff_time_input = item.get('cutoff_time')
+
+                # 如果未提供 trade_id，自动生成一个随机且不重复的 ID
+                if not trade_id:
+                    while True:
+                        trade_id = random.randint(10000, 999999)
+                        if trade_id not in used_trade_ids:
+                            used_trade_ids.add(trade_id)
+                            break
+
+                if not all([stock_code, action, quantity]):
+                    return jsonify({'error': '股票交易信息不完整，必须包含 stock_code, action, quantity'}), 400
 
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT 1 FROM trade_logs WHERE strategy_id = %s AND trade_id = %s",
@@ -639,28 +1271,86 @@ def add_strategies():
                     if cursor.fetchone():
                         return jsonify({'error': f'trade_id {trade_id} 在策略 {strategy_id} 中已存在'}), 400
 
-                if 'date' in item:
-                    intended_date = datetime.strptime(item['date'], '%Y-%m-%d').date()
-                else:
-                    intended_date = date.today()
+                # 解析日期/时间
+                try:
+                    if date_input:
+                        if ' ' in str(date_input):
+                            # 包含时间，解析为 datetime
+                            target_datetime = datetime.strptime(date_input, '%Y-%m-%d %H:%M')
+                        else:
+                            # 只有日期，解析为 date，时间为默认 09:30
+                            target_date = datetime.strptime(date_input, '%Y-%m-%d').date()
+                            target_datetime = datetime.combine(target_date, datetime.min.time()) + timedelta(hours=9, minutes=30)
+                            # 向后兼容：如果只传日期（不含时间），强制 order_type 为 daily_order
+                            order_type = 'daily_order'
+                    else:
+                        # 如果不传 date，使用当前时间
+                        target_datetime = datetime.now()
+                except ValueError:
+                    return jsonify({'error': f'日期格式错误: {date_input}，应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM'}), 400
 
-                if is_trading_day(intended_date):
-                    target_date = intended_date
+                intended_datetime = target_datetime
+
+                # 验证订单类型
+                if order_type not in ['daily_order', 'limit_order', 'market_order']:
+                    return jsonify({'error': f'不支持的订单类型: {order_type}，必须是 daily_order/limit_order/market_order'}), 400
+
+                # 限价单验证
+                if order_type == 'limit_order':
+                    if limit_price is None:
+                        return jsonify({'error': f'限价单必须提供 limit_price 参数'}), 400
+
+                    # 解析截止时间
+                    if cutoff_time_input:
+                        try:
+                            cutoff_time = datetime.strptime(cutoff_time_input, '%Y-%m-%d %H:%M')
+                        except ValueError:
+                            return jsonify({'error': f'截止时间格式错误: {cutoff_time_input}，应为 YYYY-MM-DD HH:MM'}), 400
+                    else:
+                        # 默认截止时间为目标时间 + 10 分钟
+                        cutoff_time = target_datetime + timedelta(minutes=10)
+
+                    # 验证数据可用性
+                    if not is_minute_data_available(target_datetime):
+                        return jsonify({
+                            'error': f'日期 {target_datetime} 的分钟数据不可用（超过 5 年历史），仅支持日度单'
+                        }), 400
+                elif order_type == 'market_order':
+                    # 市价单也需要验证数据可用性
+                    if not is_minute_data_available(target_datetime):
+                        return jsonify({
+                            'error': f'日期 {target_datetime} 的分钟数据不可用（超过 5 年历史），仅支持日度单'
+                        }), 400
+                    cutoff_time = None
+                    limit_price = None
+                else:  # daily_order
+                    cutoff_time = None
+                    limit_price = None
+
+                # 检查交易日
+                target_date_val = target_datetime.date()
+                if is_trading_day(target_date_val):
+                    target_date_for_db = target_datetime
                 else:
                     with conn.cursor() as cursor:
                         cursor.execute("""
                             INSERT INTO trade_logs
-                            (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date, status, fail_reason)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, 'failed', '非交易日')
-                        """, (strategy_id, stock_code, trade_id, action, quantity, intended_date, intended_date))
+                            (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date,
+                             order_type, limit_price, cutoff_time, status, fail_reason)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', '非交易日')
+                        """, (strategy_id, stock_code, trade_id, action, quantity, intended_datetime,
+                              intended_datetime, order_type, limit_price, cutoff_time))
                     continue
 
+                # 插入交易日志
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         INSERT INTO trade_logs
-                        (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date, status)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
-                    """, (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date))
+                        (strategy_id, stock_code, trade_id, action, quantity, intended_date, target_date,
+                         order_type, limit_price, cutoff_time, status, fail_reason)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', NULL)
+                    """, (strategy_id, stock_code, trade_id, action, quantity,
+                          intended_datetime, intended_datetime, order_type, limit_price, cutoff_time))
 
         conn.commit()
         return jsonify({'message': 'success'}), 200
@@ -704,11 +1394,17 @@ def get_strategy_nav_history(strategy_id):
                 first_date = row['first_date']
             if not first_date:
                 return jsonify([])
-            start_date = first_date - timedelta(days=1)
+            # first_date 现在是 datetime 类型，需要转换为 date 类型进行计算
+            first_date_val = first_date.date() if isinstance(first_date, datetime) else first_date
+            start_date = first_date_val - timedelta(days=1)
             if start_date > end_date:
                 return jsonify([])
     except Exception as e:
         return jsonify({'error': f'日期格式错误: {e}'}), 400
+
+    # 将 start_date 和 end_date 转换为 datetime 类型，以匹配数据库中的 trade_date 字段
+    start_datetime = datetime.combine(start_date, datetime.min.time()) if isinstance(start_date, date) else start_date
+    end_datetime = datetime.combine(end_date, datetime.min.time()) if isinstance(end_date, date) else end_date
 
     conn = get_db()
     try:
@@ -767,14 +1463,18 @@ def get_strategy_nav_history(strategy_id):
 
     trades_by_date = defaultdict(list)
     for t in trades:
-        trades_by_date[t['trade_date']].append(t)
+        # 使用 trade_date 的 date 部分作为字典键，确保类型一致
+        trade_date_key = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
+        trades_by_date[trade_date_key].append(t)
 
     first_trade_date = trades[0]['trade_date'] if trades else None
 
     cash = initial_capital
     positions = defaultdict(float)
     for t in trades:
-        if t['trade_date'] < start_date:
+        # 将 t['trade_date'] 转换为 date 类型进行比较
+        trade_date_val = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
+        if trade_date_val < start_date:
             qty = float(t['quantity'])
             price = float(t['price'])
             if t['action'] == 'buy':
@@ -880,59 +1580,20 @@ def get_index_data(index_code):
     price_type = request.args.get('price_type', 'close')
     if not start_date_str or not end_date_str:
         return jsonify({'error': '缺少 start_date 或 end_date 参数'}), 400
-    index_map = {
-        'sh000300': '000300.SH',
-        'sh000852': '000852.SH'
-    }
-    ts_code = index_map.get(index_code.lower())
-    if not ts_code:
-        return jsonify({'error': f'不支持的指数代码: {index_code}'}), 400
+
     try:
         start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
     except ValueError:
         return jsonify({'error': '日期格式错误，应为 YYYY-MM-DD'}), 400
-    try:
-        df = pro.index_daily(ts_code=ts_code,
-                             start_date=start_date.strftime('%Y%m%d'),
-                             end_date=end_date.strftime('%Y%m%d'))
-        if df.empty:
-            return jsonify({'error': f'指数 {index_code} 在指定区间无数据'}), 404
-        df = df.sort_values('trade_date')
-        price_map = {}
-        for _, row in df.iterrows():
-            date_obj = datetime.strptime(row['trade_date'], '%Y%m%d').date()
-            price_map[date_obj] = float(row[price_type])
-        dates = []
-        current = start_date
-        while current <= end_date:
-            dates.append(current)
-            current += timedelta(days=1)
-        base_price = None
-        last_price = None
-        result = []
-        for d in dates:
-            if d in price_map:
-                price = price_map[d]
-                last_price = price
-            else:
-                price = last_price
-            if price is None:
-                continue
-            if base_price is None:
-                base_price = price
-                relative = 100.0
-            else:
-                relative = (price / base_price) * 100
-            result.append({
-                'date': d.strftime('%Y-%m-%d'),
-                'value': round(price, 2),
-                'percent_change': round(relative, 2)
-            })
-        return jsonify(result)
-    except Exception as e:
-        print(f"[指数数据获取失败] {index_code}: {e}")
-        return jsonify({'error': str(e)}), 500
+
+    # 使用缓存函数获取指数数据
+    result = get_index_data_cached(index_code, start_date, end_date, price_type)
+
+    if result is None:
+        return jsonify({'error': f'指数 {index_code} 在指定区间无数据或获取失败'}), 500
+
+    return jsonify(result)
 
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
@@ -947,6 +1608,8 @@ def get_strategy_holdings_at_date(strategy_id):
     display_date = target_date
     if not is_trading_day(target_date):
         target_date = get_next_trading_day(target_date, 'prev')
+    # 将 target_date 转换为 datetime 类型以匹配数据库中的 trade_date 字段
+    target_datetime = datetime.combine(target_date, datetime.min.time()) if isinstance(target_date, date) else target_date
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -960,7 +1623,7 @@ def get_strategy_holdings_at_date(strategy_id):
                 FROM trades
                 WHERE strategy_id = %s AND trade_date <= %s
                 ORDER BY trade_date, id
-            """, (strategy_id, target_date))
+            """, (strategy_id, target_datetime))
             trades = cursor.fetchall()
             cursor.execute("""
                 SELECT stock_code, trade_id, action, quantity, intended_date
@@ -1021,7 +1684,9 @@ def get_strategy_holdings_at_date(strategy_id):
         total_mv_close += mv_close
         batches_detail = []
         for batch in stock_batches[stock_code]:
-            holding_days = count_trading_days(batch['buy_date'], display_date)
+            # 将 buy_date 转换为 date 类型
+            buy_date_val = batch['buy_date'].date() if isinstance(batch['buy_date'], datetime) else batch['buy_date']
+            holding_days = count_trading_days(buy_date_val, display_date)
             batches_detail.append([batch['quantity'], holding_days])
         holdings_list.append({
             'stock_code': stock_code,
@@ -1080,6 +1745,16 @@ def get_strategy_logs(strategy_id):
             else:
                 cursor.execute("SELECT * FROM trade_logs WHERE strategy_id = %s ORDER BY intended_date DESC, created_at", (strategy_id,))
             logs = cursor.fetchall()
+
+        # 格式化 datetime 字段
+        for log in logs:
+            for key in ['intended_date', 'target_date', 'actual_date', 'cutoff_time']:
+                if log.get(key) and isinstance(log[key], datetime):
+                    log[key] = log[key].strftime('%Y-%m-%d %H:%M')
+                elif log.get(key):
+                    # 如果是字符串，去掉秒数
+                    log[key] = str(log[key])[:16]  # YYYY-MM-DD HH:MM
+
         return jsonify(logs)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1139,6 +1814,10 @@ def get_strategy_returns(strategy_id):
     except:
         return jsonify({'error': '日期格式错误'}), 400
 
+    # 将 start_date 和 end_date 转换为 datetime 类型，以匹配数据库中的 trade_date 字段
+    start_datetime = datetime.combine(start_date, datetime.min.time()) if isinstance(start_date, date) else start_date
+    end_datetime = datetime.combine(end_date, datetime.max.time()) if isinstance(end_date, date) else end_date
+
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -1148,7 +1827,7 @@ def get_strategy_returns(strategy_id):
                 WHERE strategy_id = %s AND action = 'buy'
                   AND trade_date BETWEEN %s AND %s
                 ORDER BY trade_date, stock_code
-            """, (strategy_id, start_date, end_date))
+            """, (strategy_id, start_datetime, end_datetime))
             trades = cursor.fetchall()
     finally:
         conn.close()
@@ -1158,7 +1837,9 @@ def get_strategy_returns(strategy_id):
 
     groups = defaultdict(list)
     for t in trades:
-        groups[t['trade_date']].append(t)
+        # 使用 trade_date 的 date 部分作为字典键，确保类型一致
+        trade_date_key = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
+        groups[trade_date_key].append(t)
 
     result = []
     for trade_date, group_trades in groups.items():
@@ -1257,9 +1938,13 @@ init_stock_basic_cache()
 
 # 启动调度器
 scheduler = BackgroundScheduler()
+# 原有的待成交订单处理（日度单、市价单），每 30 秒执行一次
 scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
+# 新增：限价单处理，每分钟执行一次
+scheduler.add_job(func=process_limit_orders, trigger="interval", minutes=1)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
+    
