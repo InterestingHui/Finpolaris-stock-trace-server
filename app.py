@@ -14,6 +14,8 @@ import atexit
 import logging
 from functools import lru_cache
 import random
+import time
+import threading
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
@@ -41,6 +43,36 @@ DB_CONFIG = {
 def get_db():
     return pymysql.connect(**DB_CONFIG)
 
+# ========== Tushare 请求限流器 ==========
+class TushareRateLimiter:
+    """Tushare API 请求限流器 - 防止触发流控"""
+    def __init__(self, max_requests_per_minute=100):
+        self.max_requests_per_minute = max_requests_per_minute
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def wait_if_needed(self):
+        """如果需要等待，则暂停以避免超出限流"""
+        with self.lock:
+            now = time.time()
+            # 移除超过 1 分钟的记录
+            self.requests = [t for t in self.requests if now - t < 60]
+
+            # 如果达到限制，等待
+            if len(self.requests) >= self.max_requests_per_minute:
+                sleep_time = 60 - (now - self.requests[0])
+                if sleep_time > 0:
+                    print(f"[限流] Tushare API 请求达到限制，等待 {sleep_time:.1f} 秒...")
+                    time.sleep(sleep_time)
+                    # 等待后再次清理
+                    now = time.time()
+                    self.requests = [t for t in self.requests if now - t < 60]
+
+            self.requests.append(now)
+
+# 全局限流器实例
+rate_limiter = TushareRateLimiter(max_requests_per_minute=120)
+
 # ========== 交易日历缓存 ==========
 _trade_calendar_cache = {}
 
@@ -50,6 +82,7 @@ def load_trade_calendar(start_date: date = None, end_date: date = None):
         start_date = date.today() - timedelta(days=365)
     if end_date is None:
         end_date = date.today() + timedelta(days=365)
+    rate_limiter.wait_if_needed()
     try:
         df = pro.trade_cal(exchange='SSE',
                            start_date=start_date.strftime('%Y%m%d'),
@@ -65,6 +98,7 @@ def is_trading_day(dt: date) -> bool:
     date_str = dt.strftime('%Y%m%d')
     if date_str in _trade_calendar_cache:
         return _trade_calendar_cache[date_str]
+    rate_limiter.wait_if_needed()
     try:
         df = pro.trade_cal(exchange='SSE', start_date=date_str, end_date=date_str)
         if df.empty:
@@ -95,49 +129,55 @@ def count_trading_days(start_date: date, end_date: date) -> int:
         current += timedelta(days=1)
     return count
 
-# ========== 价格获取 ==========
+# ========== 价格获取（使用缓存） ==========
 def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=False):
+    """获取价格，优先使用缓存"""
     if isinstance(trade_date, date):
+        target_date = trade_date
         trade_date = trade_date.strftime('%Y%m%d')
+    else:
+        target_date = datetime.strptime(trade_date, '%Y%m%d').date()
+
+    # 先尝试从缓存读取
+    cached = _get_cached_daily(stock_code, target_date)
+    if cached:
+        price = cached.get(price_type)
+        if price is not None:
+            return price, target_date
+
+    # 缓存未命中，从 Tushare 获取
+    rate_limiter.wait_if_needed()
     try:
         df = pro.daily(ts_code=stock_code, start_date=trade_date, end_date=trade_date)
         if df.empty:
             if not auto_next:
                 return None, None
-            next_date = get_next_trading_day(datetime.strptime(trade_date, '%Y%m%d').date(), 'next')
+            next_date = get_next_trading_day(target_date, 'next')
             next_str = next_date.strftime('%Y%m%d')
+            rate_limiter.wait_if_needed()
             df = pro.daily(ts_code=stock_code, start_date=next_str, end_date=next_str)
             if df.empty:
                 return None, None
             actual_date = next_date
         else:
-            actual_date = datetime.strptime(trade_date, '%Y%m%d').date()
-        price = float(df.iloc[0][price_type])
+            actual_date = target_date
+        row = df.iloc[0]
+        price = float(row[price_type])
+
+        # 保存到缓存
+        data = {
+            'open': float(row['open']),
+            'close': float(row['close']),
+            'high': float(row['high']),
+            'low': float(row['low'])
+        }
+        _save_cached_daily(stock_code, actual_date, data)
+
         return price, actual_date
     except Exception as e:
         print(f"[ERROR] get_price_from_tushare: {e}")
         return None, None
 
-def get_limit_price(stock_code, trade_date):
-    try:
-        if isinstance(trade_date, date):
-            trade_date = trade_date.strftime('%Y%m%d')
-        df = pro.stk_limit(ts_code=stock_code, trade_date=trade_date)
-        if not df.empty:
-            return float(df.iloc[0]['up_limit']), float(df.iloc[0]['down_limit'])
-        return None, None
-    except Exception as e:
-        print(f"[ERROR] get_limit_price: {e}")
-        return None, None
-
-def get_latest_price(stock_code, price_type='close'):
-    try:
-        df = pro.daily(ts_code=stock_code, limit=1)
-        if not df.empty:
-            return float(df.iloc[0][price_type])
-    except Exception as e:
-        print(f"get_latest_price error: {e}")
-    return None
 
 # ========== 日线缓存 ==========
 def _get_cached_daily(stock_code: str, trade_date: date):
@@ -188,6 +228,7 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
     if cached:
         return cached
     date_str = trade_date.strftime('%Y%m%d')
+    rate_limiter.wait_if_needed()
     try:
         df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
         if df.empty:
@@ -204,6 +245,84 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
     except Exception as e:
         print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
+
+# ========== 批量获取价格数据 ==========
+def batch_fetch_daily_prices(stock_codes: list, start_date: date, end_date: date, price_type='close') -> dict:
+    """
+    批量获取多只股票在指定日期范围内的价格数据
+    返回: {(stock_code, trade_date): price}
+    """
+    price_cache = {}
+
+    # 先从数据库缓存中批量读取
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(stock_codes))
+            cursor.execute(f"""
+                SELECT stock_code, trade_date, open, close, high, low
+                FROM stock_daily_cache
+                WHERE stock_code IN ({placeholders}) AND trade_date BETWEEN %s AND %s
+            """, stock_codes + [start_date, end_date])
+
+            for row in cursor.fetchall():
+                stock_code = row['stock_code']
+                trade_date = row['trade_date']
+                # 获取日期部分
+                if isinstance(trade_date, datetime):
+                    trade_date = trade_date.date()
+                price_cache[(stock_code, trade_date, 'open')] = float(row['open'])
+                price_cache[(stock_code, trade_date, 'close')] = float(row['close'])
+                price_cache[(stock_code, trade_date, 'high')] = float(row['high'])
+                price_cache[(stock_code, trade_date, 'low')] = float(row['low'])
+    except Exception as e:
+        print(f"[批量缓存] 读取失败: {e}")
+    finally:
+        conn.close()
+
+    # 找出需要从 Tushare 获取的股票代码
+    stocks_to_fetch = []
+    for stock_code in stock_codes:
+        has_all_cached = True
+        current = start_date
+        while current <= end_date:
+            if (stock_code, current, price_type) not in price_cache:
+                has_all_cached = False
+                break
+            current += timedelta(days=1)
+        if not has_all_cached:
+            stocks_to_fetch.append(stock_code)
+
+    # 批量从 Tushare 获取缺失的数据
+    if stocks_to_fetch:
+        print(f"[批量获取] 需要从 Tushare 获取 {len(stocks_to_fetch)} 只股票的数据")
+        for stock_code in stocks_to_fetch:
+            rate_limiter.wait_if_needed()
+            start_str = start_date.strftime('%Y%m%d')
+            end_str = end_date.strftime('%Y%m%d')
+            try:
+                df = pro.daily(ts_code=stock_code, start_date=start_str, end_date=end_str)
+                if not df.empty:
+                    # 保存到数据库缓存
+                    for _, row in df.iterrows():
+                        trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
+                        data = {
+                            'open': float(row['open']),
+                            'close': float(row['close']),
+                            'high': float(row['high']),
+                            'low': float(row['low'])
+                        }
+                        _save_cached_daily(stock_code, trade_date, data)
+
+                        # 更新内存缓存
+                        price_cache[(stock_code, trade_date, 'open')] = data['open']
+                        price_cache[(stock_code, trade_date, 'close')] = data['close']
+                        price_cache[(stock_code, trade_date, 'high')] = data['high']
+                        price_cache[(stock_code, trade_date, 'low')] = data['low']
+            except Exception as e:
+                print(f"[批量获取] {stock_code} 获取失败: {e}")
+
+    return price_cache
 
 # ========== 指数数据缓存 ==========
 _index_cache = {}  # 缓存指数数据，格式: {(index_code, start_date, end_date, price_type): data}
@@ -225,6 +344,7 @@ def get_index_data_cached(index_code: str, start_date: date, end_date: date, pri
     if not ts_code:
         return None
 
+    rate_limiter.wait_if_needed()
     try:
         df = pro.index_daily(
             ts_code=ts_code,
@@ -308,6 +428,7 @@ def _save_cached_name(stock_code: str, stock_name: str):
 def init_stock_basic_cache():
     """启动时从 Tushare 拉取全量股票基本信息，写入数据库缓存"""
     print("[股票名称] 开始从 Tushare 初始化股票基本信息...")
+    rate_limiter.wait_if_needed()
     try:
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
         if df.empty:
@@ -357,6 +478,7 @@ def get_stock_market_value(stock_code: str, trade_date: date):
         conn.close()
 
     date_str = trade_date.strftime('%Y%m%d')
+    rate_limiter.wait_if_needed()
     try:
         df = pro.daily_basic(ts_code=stock_code, trade_date=date_str,
                              fields='ts_code,trade_date,total_mv,circ_mv')
@@ -379,8 +501,50 @@ def get_stock_market_value(stock_code: str, trade_date: date):
         print(f"[市值获取失败] {stock_code} {trade_date}: {e}")
     return None
 
-# ========== VWAP ==========
+# ========== VWAP 缓存 ==========
+def _get_cached_vwap(stock_code: str, trade_date: date):
+    """从数据库缓存获取 VWAP"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT vwap
+                FROM stock_vwap_cache
+                WHERE stock_code = %s AND trade_date = %s
+            """, (stock_code, trade_date))
+            row = cursor.fetchone()
+            return float(row['vwap']) if row else None
+    except Exception as e:
+        print(f"[VWAP缓存] 读取失败: {e}")
+        return None
+    finally:
+        conn.close()
+
+def _save_cached_vwap(stock_code: str, trade_date: date, vwap: float):
+    """保存 VWAP 到数据库缓存"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO stock_vwap_cache (stock_code, trade_date, vwap)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE vwap = VALUES(vwap)
+            """, (stock_code, trade_date, vwap))
+        conn.commit()
+    except Exception as e:
+        print(f"[VWAP缓存] 保存失败: {e}")
+    finally:
+        conn.close()
+
 def get_vwap(stock_code: str, trade_date: date) -> float:
+    """获取 VWAP（优先从缓存读取）"""
+    # 先尝试从缓存读取
+    cached = _get_cached_vwap(stock_code, trade_date)
+    if cached is not None:
+        return cached
+
+    # 缓存未命中，从 Tushare 获取
+    rate_limiter.wait_if_needed()
     date_str = trade_date.strftime('%Y%m%d')
     try:
         df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
@@ -392,10 +556,123 @@ def get_vwap(stock_code: str, trade_date: date) -> float:
         if vol == 0:
             return None
         vwap = (amount * 1000) / (vol * 100)
-        return round(vwap, 3)
+        vwap = round(vwap, 3)
+
+        # 保存到缓存
+        _save_cached_vwap(stock_code, trade_date, vwap)
+        return vwap
     except Exception as e:
         print(f"[VWAP] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
+
+# ========== 限价缓存 ==========
+def _get_cached_limit_price(stock_code: str, trade_date: date):
+    """从数据库缓存获取限价"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT up_limit, down_limit
+                FROM stock_limit_cache
+                WHERE stock_code = %s AND trade_date = %s
+            """, (stock_code, trade_date))
+            row = cursor.fetchone()
+            if row:
+                return float(row['up_limit']), float(row['down_limit'])
+            return None, None
+    except Exception as e:
+        print(f"[限价缓存] 读取失败: {e}")
+        return None, None
+    finally:
+        conn.close()
+
+def _save_cached_limit_price(stock_code: str, trade_date: date, up_limit: float, down_limit: float):
+    """保存限价到数据库缓存"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO stock_limit_cache (stock_code, trade_date, up_limit, down_limit)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    up_limit = VALUES(up_limit),
+                    down_limit = VALUES(down_limit)
+            """, (stock_code, trade_date, up_limit, down_limit))
+        conn.commit()
+    except Exception as e:
+        print(f"[限价缓存] 保存失败: {e}")
+    finally:
+        conn.close()
+
+def get_limit_price(stock_code, trade_date):
+    """获取限价（优先从缓存读取）"""
+    # 先尝试从缓存读取
+    up_limit, down_limit = _get_cached_limit_price(stock_code, trade_date)
+    if up_limit is not None and down_limit is not None:
+        return up_limit, down_limit
+
+    # 缓存未命中，从 Tushare 获取
+    rate_limiter.wait_if_needed()
+    try:
+        if isinstance(trade_date, date):
+            trade_date = trade_date.strftime('%Y%m%d')
+        df = pro.stk_limit(ts_code=stock_code, trade_date=trade_date)
+        if not df.empty:
+            up = float(df.iloc[0]['up_limit'])
+            down = float(df.iloc[0]['down_limit'])
+            # 保存到缓存
+            _save_cached_limit_price(stock_code, datetime.strptime(trade_date, '%Y%m%d').date(), up, down)
+            return up, down
+        return None, None
+    except Exception as e:
+        print(f"[ERROR] get_limit_price: {e}")
+        return None, None
+
+# ========== 最新价格缓存 ==========
+def get_latest_price(stock_code, price_type='close'):
+    """获取最新价格（优先从缓存读取）"""
+    # 先尝试从数据库缓存读取最新日期的价格
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT trade_date, close
+                FROM stock_daily_cache
+                WHERE stock_code = %s
+                ORDER BY trade_date DESC
+                LIMIT 1
+            """, (stock_code,))
+            row = cursor.fetchone()
+            if row:
+                # 使用缓存的最新日期的价格（假设价格变化不大）
+                # 对于实时性要求不高的场景，缓存1小时内的数据是可以接受的
+                latest_date = row['trade_date']
+                now = datetime.now()
+                # 如果缓存的数据是今天且在6小时内的，直接返回
+                if isinstance(latest_date, datetime):
+                    latest_date = latest_date.date()
+                if (now.date() - latest_date).days <= 1:
+                    if price_type == 'close':
+                        return float(row['close'])
+                    # 如果需要其他价格类型，尝试获取
+                    rate_limiter.wait_if_needed()
+                    df = pro.daily(ts_code=stock_code, limit=1)
+                    if not df.empty:
+                        return float(df.iloc[0][price_type])
+    except Exception as e:
+        print(f"[最新价格缓存] 读取失败: {e}")
+    finally:
+        conn.close()
+
+    # 缓存未命中或过期，从 Tushare 获取
+    rate_limiter.wait_if_needed()
+    try:
+        df = pro.daily(ts_code=stock_code, limit=1)
+        if not df.empty:
+            return float(df.iloc[0][price_type])
+    except Exception as e:
+        print(f"get_latest_price error: {e}")
+    return None
 
 # ========== 分钟级价格缓存 ==========
 stock_min_cache = {}
@@ -1434,19 +1711,14 @@ def get_strategy_nav_history(strategy_id):
         dates.append(current)
         current += timedelta(days=1)
 
+    # 使用批量获取代替单独请求
+    price_cache_all = batch_fetch_daily_prices(stock_codes, start_date, end_date)
+
+    # 提取所需的价格类型
     price_cache = {}
-    for stock_code in stock_codes:
-        start_str = start_date.strftime('%Y%m%d')
-        end_str = end_date.strftime('%Y%m%d')
-        try:
-            df = pro.daily(ts_code=stock_code, start_date=start_str, end_date=end_str)
-            if not df.empty:
-                for _, row in df.iterrows():
-                    trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
-                    price = float(row[price_type])
-                    price_cache[(stock_code, trade_date)] = price
-        except Exception as e:
-            print(f"[ERROR] 获取 {stock_code} 价格失败: {e}")
+    for (stock_code, trade_date, pt), price in price_cache_all.items():
+        if pt == price_type:
+            price_cache[(stock_code, trade_date)] = price
 
     conn = get_db()
     try:
