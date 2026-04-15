@@ -17,7 +17,38 @@ import random
 import time
 import threading
 
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+# ========== 日志配置 ==========
+def setup_logging():
+    """配置日志系统"""
+    log_level_str = os.environ.get('LOG_LEVEL', 'WARN').upper()
+    log_level = getattr(logging, log_level_str, logging.WARNING)
+
+    # 配置日志格式
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 配置处理器
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(log_level)
+    handler.setFormatter(formatter)
+
+    # 配置根日志器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+
+    # 设置第三方库的日志级别
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('pymysql').setLevel(logging.WARNING)
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
+setup_logging()
+
+# 获取应用日志器
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -62,7 +93,7 @@ class TushareRateLimiter:
             if len(self.requests) >= self.max_requests_per_minute:
                 sleep_time = 60 - (now - self.requests[0])
                 if sleep_time > 0:
-                    print(f"[限流] Tushare API 请求达到限制，等待 {sleep_time:.1f} 秒...")
+                    logger.warning(f"Tushare API 请求达到限制，等待 {sleep_time:.1f} 秒...")
                     time.sleep(sleep_time)
                     # 等待后再次清理
                     now = time.time()
@@ -89,9 +120,9 @@ def load_trade_calendar(start_date: date = None, end_date: date = None):
                            end_date=end_date.strftime('%Y%m%d'))
         for _, row in df.iterrows():
             _trade_calendar_cache[row['cal_date']] = (row['is_open'] == 1)
-        print(f"[交易日历] 成功加载 {len(_trade_calendar_cache)} 条记录")
+        logger.info(f"交易日历成功加载 {len(_trade_calendar_cache)} 条记录")
     except Exception as e:
-        print(f"[交易日历加载失败] {e}")
+        logger.error(f"交易日历加载失败: {e}")
 
 def is_trading_day(dt: date) -> bool:
     """从缓存判断是否为交易日（若缺失则实时查询并补充缓存）"""
@@ -108,7 +139,7 @@ def is_trading_day(dt: date) -> bool:
         _trade_calendar_cache[date_str] = is_open
         return is_open
     except Exception as e:
-        print(f"[ERROR] is_trading_day: {e}")
+        logger.error(f"is_trading_day 失败: {e}")
         return False
 
 def get_next_trading_day(dt: date, direction='next') -> date:
@@ -175,7 +206,7 @@ def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=
 
         return price, actual_date
     except Exception as e:
-        print(f"[ERROR] get_price_from_tushare: {e}")
+        logger.error(f"get_price_from_tushare 失败: {e}")
         return None, None
 
 
@@ -198,7 +229,7 @@ def _get_cached_daily(stock_code: str, trade_date: date):
                     'low': float(row['low'])
                 }
     except Exception as e:
-        print(f"[缓存] 读取日线失败: {e}")
+        logger.debug(f"读取日线缓存失败: {e}")
     finally:
         conn.close()
     return None
@@ -208,7 +239,7 @@ def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO stock_daily_cache 
+                INSERT INTO stock_daily_cache
                 (stock_code, trade_date, open, close, high, low)
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
@@ -219,7 +250,7 @@ def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
             ))
         conn.commit()
     except Exception as e:
-        print(f"[缓存] 保存日线失败: {e}")
+        logger.debug(f"保存日线缓存失败: {e}")
     finally:
         conn.close()
 
@@ -243,7 +274,7 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
         _save_cached_daily(stock_code, trade_date, data)
         return data
     except Exception as e:
-        print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
+        logger.debug(f"获取日线数据失败 {stock_code} {date_str}: {e}")
         return None
 
 # ========== 批量获取价格数据 ==========
@@ -276,7 +307,7 @@ def batch_fetch_daily_prices(stock_codes: list, start_date: date, end_date: date
                 price_cache[(stock_code, trade_date, 'high')] = float(row['high'])
                 price_cache[(stock_code, trade_date, 'low')] = float(row['low'])
     except Exception as e:
-        print(f"[批量缓存] 读取失败: {e}")
+        logger.debug(f"批量读取缓存失败: {e}")
     finally:
         conn.close()
 
@@ -295,7 +326,7 @@ def batch_fetch_daily_prices(stock_codes: list, start_date: date, end_date: date
 
     # 批量从 Tushare 获取缺失的数据
     if stocks_to_fetch:
-        print(f"[批量获取] 需要从 Tushare 获取 {len(stocks_to_fetch)} 只股票的数据")
+        logger.info(f"需要从 Tushare 获取 {len(stocks_to_fetch)} 只股票的数据")
         for stock_code in stocks_to_fetch:
             rate_limiter.wait_if_needed()
             start_str = start_date.strftime('%Y%m%d')
@@ -320,7 +351,7 @@ def batch_fetch_daily_prices(stock_codes: list, start_date: date, end_date: date
                         price_cache[(stock_code, trade_date, 'high')] = data['high']
                         price_cache[(stock_code, trade_date, 'low')] = data['low']
             except Exception as e:
-                print(f"[批量获取] {stock_code} 获取失败: {e}")
+                logger.debug(f"批量获取 {stock_code} 失败: {e}")
 
     return price_cache
 
@@ -394,7 +425,7 @@ def get_index_data_cached(index_code: str, start_date: date, end_date: date, pri
         return result
 
     except Exception as e:
-        print(f"[指数数据获取失败] {index_code}: {e}")
+        logger.error(f"获取指数数据失败 {index_code}: {e}")
         return None
 
 # ========== 股票名称缓存（基于 Tushare） ==========
@@ -406,7 +437,7 @@ def _get_cached_name(stock_code: str):
             row = cursor.fetchone()
             return row['stock_name'] if row else None
     except Exception as e:
-        print(f"[缓存] 读取名称失败: {e}")
+        logger.debug(f"读取名称缓存失败: {e}")
         return None
     finally:
         conn.close()
@@ -421,18 +452,18 @@ def _save_cached_name(stock_code: str, stock_name: str):
             """, (stock_code, stock_name))
         conn.commit()
     except Exception as e:
-        print(f"[缓存] 保存名称失败: {e}")
+        logger.debug(f"保存名称缓存失败: {e}")
     finally:
         conn.close()
 
 def init_stock_basic_cache():
     """启动时从 Tushare 拉取全量股票基本信息，写入数据库缓存"""
-    print("[股票名称] 开始从 Tushare 初始化股票基本信息...")
+    logger.info("开始从 Tushare 初始化股票基本信息...")
     rate_limiter.wait_if_needed()
     try:
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
         if df.empty:
-            print("[股票名称] Tushare 未返回数据")
+            logger.warning("Tushare 未返回股票名称数据")
             return
 
         conn = get_db()
@@ -445,14 +476,14 @@ def init_stock_basic_cache():
                         ON DUPLICATE KEY UPDATE stock_name = VALUES(stock_name)
                     """, (row['ts_code'], row['name']))
             conn.commit()
-            print(f"[股票名称] 成功缓存 {len(df)} 只股票名称")
+            logger.info(f"成功缓存 {len(df)} 只股票名称")
         except Exception as e:
             conn.rollback()
-            print(f"[股票名称] 数据库写入失败: {e}")
+            logger.error(f"写入股票名称数据库失败: {e}")
         finally:
             conn.close()
     except Exception as e:
-        print(f"[股票名称] Tushare 获取失败: {e}")
+        logger.error(f"从 Tushare 获取股票名称失败: {e}")
 
 @lru_cache(maxsize=5000)
 def get_stock_name(stock_code: str) -> str:
@@ -473,7 +504,7 @@ def get_stock_market_value(stock_code: str, trade_date: date):
             if row and row['total_mv'] is not None:
                 return float(row['total_mv'])
     except Exception as e:
-        print(f"[市值缓存读取失败] {e}")
+        logger.debug(f"读取市值缓存失败: {e}")
     finally:
         conn.close()
 
@@ -498,7 +529,7 @@ def get_stock_market_value(stock_code: str, trade_date: date):
                 conn.close()
             return total_mv
     except Exception as e:
-        print(f"[市值获取失败] {stock_code} {trade_date}: {e}")
+        logger.debug(f"获取市值失败 {stock_code} {trade_date}: {e}")
     return None
 
 # ========== VWAP 缓存 ==========
@@ -515,7 +546,7 @@ def _get_cached_vwap(stock_code: str, trade_date: date):
             row = cursor.fetchone()
             return float(row['vwap']) if row else None
     except Exception as e:
-        print(f"[VWAP缓存] 读取失败: {e}")
+        logger.debug(f"读取VWAP缓存失败: {e}")
         return None
     finally:
         conn.close()
@@ -532,7 +563,7 @@ def _save_cached_vwap(stock_code: str, trade_date: date, vwap: float):
             """, (stock_code, trade_date, vwap))
         conn.commit()
     except Exception as e:
-        print(f"[VWAP缓存] 保存失败: {e}")
+        logger.debug(f"保存VWAP缓存失败: {e}")
     finally:
         conn.close()
 
@@ -562,7 +593,7 @@ def get_vwap(stock_code: str, trade_date: date) -> float:
         _save_cached_vwap(stock_code, trade_date, vwap)
         return vwap
     except Exception as e:
-        print(f"[VWAP] Tushare 获取失败 {stock_code} {date_str}: {e}")
+        logger.debug(f"从Tushare获取VWAP失败 {stock_code} {date_str}: {e}")
         return None
 
 # ========== 限价缓存 ==========
@@ -581,7 +612,7 @@ def _get_cached_limit_price(stock_code: str, trade_date: date):
                 return float(row['up_limit']), float(row['down_limit'])
             return None, None
     except Exception as e:
-        print(f"[限价缓存] 读取失败: {e}")
+        logger.debug(f"读取限价缓存失败: {e}")
         return None, None
     finally:
         conn.close()
@@ -600,7 +631,7 @@ def _save_cached_limit_price(stock_code: str, trade_date: date, up_limit: float,
             """, (stock_code, trade_date, up_limit, down_limit))
         conn.commit()
     except Exception as e:
-        print(f"[限价缓存] 保存失败: {e}")
+        logger.debug(f"保存限价缓存失败: {e}")
     finally:
         conn.close()
 
@@ -625,7 +656,7 @@ def get_limit_price(stock_code, trade_date):
             return up, down
         return None, None
     except Exception as e:
-        print(f"[ERROR] get_limit_price: {e}")
+        logger.debug(f"获取限价失败: {e}")
         return None, None
 
 # ========== 最新价格缓存 ==========
@@ -660,7 +691,7 @@ def get_latest_price(stock_code, price_type='close'):
                     if not df.empty:
                         return float(df.iloc[0][price_type])
     except Exception as e:
-        print(f"[最新价格缓存] 读取失败: {e}")
+        logger.debug(f"读取最新价格缓存失败: {e}")
     finally:
         conn.close()
 
@@ -671,7 +702,7 @@ def get_latest_price(stock_code, price_type='close'):
         if not df.empty:
             return float(df.iloc[0][price_type])
     except Exception as e:
-        print(f"get_latest_price error: {e}")
+        logger.debug(f"获取最新价格失败: {e}")
     return None
 
 # ========== 分钟级价格缓存 ==========
@@ -706,7 +737,7 @@ def get_minute_price(stock_code: str, target_datetime: datetime) -> dict:
                 stock_min_cache[cache_key] = price_data
                 return price_data
     except Exception as e:
-        print(f"[缓存查询错误] {e}")
+        logger.debug(f"查询分钟价格缓存失败: {e}")
     finally:
         conn.close()
 
@@ -847,7 +878,7 @@ def calculate_strategy_cash_and_positions(strategy_id):
             positions = {row['stock_code']: row['net_qty'] for row in cursor.fetchall()}
         return cash, positions
     except Exception as e:
-        print(f"[ERROR] calculate_strategy_cash_and_positions: {e}")
+        logger.error(f"计算策略现金和持仓失败: {e}")
         return None, None
     finally:
         conn.close()
@@ -933,7 +964,7 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
         limit_price: 限价单价格
         cutoff_time: 限价单截止时间
     """
-    print(f"[DEBUG] execute_trade 开始: trade_id={trade_id}, action={action}, order_type={order_type}, target_datetime={target_datetime}")
+    logger.debug(f"execute_trade 开始: trade_id={trade_id}, action={action}, order_type={order_type}, target_datetime={target_datetime}")
     target_date = target_datetime.date() if isinstance(target_datetime, datetime) else target_datetime
 
     # 根据订单类型获取成交价
@@ -1194,10 +1225,10 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
             values = list(update_fields.values()) + [log_id]
             cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
         conn.commit()
-        print(f"[INFO] 交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{actual_price} ({order_type})")
+        logger.info(f"交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{actual_price} ({order_type})")
     except pymysql.err.IntegrityError as e:
         conn.rollback()
-        print(f"[WARN] 唯一约束冲突，交易已存在，忽略本次重复执行: {e}")
+        logger.warning(f"唯一约束冲突，交易已存在，忽略本次重复执行: {e}")
         with conn.cursor() as cursor:
             cursor.execute(
                 "UPDATE trade_logs SET status='success', actual_date=%s, fail_reason=NULL WHERE id=%s",
@@ -1206,7 +1237,7 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
         conn.commit()
     except Exception as e:
         conn.rollback()
-        print(f"[ERROR] 交易执行失败: {e}")
+        logger.error(f"交易执行失败: {e}")
         with conn.cursor() as cursor:
             cursor.execute(
                 "UPDATE trade_logs SET status='failed', fail_reason=%s WHERE id=%s",
@@ -1248,7 +1279,7 @@ def process_pending_orders():
                         cursor2.execute("UPDATE trade_logs SET status='success', actual_date=%s WHERE id=%s",
                                         (order['target_date'], order['id']))
                     conn.commit()
-                    print(f"[INFO] 交易已存在，日志标记为 success: {order['strategy_id']} trade_id={order['trade_id']}")
+                    logger.info(f"交易已存在，日志标记为 success: {order['strategy_id']} trade_id={order['trade_id']}")
                     continue
         finally:
             conn.close()
@@ -1279,7 +1310,7 @@ def process_limit_orders():
     finally:
         conn.close()
 
-    print(f"[DEBUG] process_limit_orders 查询到 {len(pending_orders)} 个待处理限价单")
+    logger.debug(f"process_limit_orders 查询到 {len(pending_orders)} 个待处理限价单")
 
     for order in pending_orders:
         log_id = order['id']
@@ -1292,14 +1323,14 @@ def process_limit_orders():
         limit_price = order['limit_price']
         cutoff_time = order['cutoff_time']
 
-        print(f"[DEBUG] 处理限价单: trade_id={trade_id}, target_datetime={target_datetime}, limit_price={limit_price}, cutoff_time={cutoff_time}")
+        logger.debug(f"处理限价单: trade_id={trade_id}, target_datetime={target_datetime}, limit_price={limit_price}, cutoff_time={cutoff_time}")
 
         # 获取该日期的5分钟K线数据
         date_str = target_datetime.date().strftime('%Y-%m-%d')
         day_minute_data = get_day_minute_data(stock_code, date_str)
 
         if not day_minute_data:
-            print(f"[DEBUG] 无法获取 {date_str} 的分钟数据")
+            logger.debug(f"无法获取 {date_str} 的分钟数据")
             continue
 
         # 在目标时间到截止时间之间查找满足条件的时间点
@@ -1330,7 +1361,7 @@ def process_limit_orders():
                 filled = True
                 fill_time = minute_time
                 fill_price = actual_price
-                print(f"[DEBUG] 找到满足条件的时间点: {fill_time}, 价格: {fill_price:.3f}")
+                logger.debug(f"找到满足条件的时间点: {fill_time}, 价格: {fill_price:.3f}")
                 break
 
         if filled:
@@ -1341,7 +1372,7 @@ def process_limit_orders():
             )
         else:
             # 没有找到满足条件的时间点
-            print(f"[DEBUG] 限价单未找到满足条件的时间点，标记为失败")
+            logger.debug(f"限价单未找到满足条件的时间点，标记为失败")
             conn = get_db()
             try:
                 with conn.cursor() as cursor:
@@ -1371,7 +1402,7 @@ def get_day_minute_data(stock_code: str, date_str: str) -> list:
 
     lg = bs.login()
     if lg.error_code != '0':
-        print(f"[DEBUG] BaoStock登录失败: {lg.error_msg}")
+        logger.debug(f"BaoStock登录失败: {lg.error_msg}")
         bs.logout()
         return None
 
@@ -1467,18 +1498,18 @@ def execute_limit_order_fill(log_id, strategy_id, stock_code, trade_id, action, 
                 values = list(update_fields.values()) + [log_id]
                 cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
             conn.commit()
-            print(f"[INFO] 限价单成交: {strategy_id} trade_id={trade_id} {action} {quantity}@{fill_price:.3f} @ {fill_time}")
+            logger.info(f"限价单成交: {strategy_id} trade_id={trade_id} {action} {quantity}@{fill_price:.3f} @ {fill_time}")
         except pymysql.err.IntegrityError as e:
             conn.rollback()
-            print(f"[WARN] 限价单已存在: {e}")
+            logger.warning(f"限价单已存在: {e}")
         except Exception as e:
             conn.rollback()
-            print(f"[ERROR] 限价单执行失败: {e}")
+            logger.error(f"限价单执行失败: {e}")
         finally:
             conn.close()
 
     except Exception as e:
-        print(f"[ERROR] execute_limit_order_fill 失败: {e}")
+        logger.error(f"execute_limit_order_fill 失败: {e}")
 
 # ========== 路由 ==========
 @app.route('/')
@@ -1487,7 +1518,7 @@ def index():
 
 @app.route('/api/strategies', methods=['POST'])
 def add_strategies():
-    print("[DEBUG] POST /api/strategies")
+    logger.debug("POST /api/strategies")
     data = request.get_json()
     if not isinstance(data, list):
         return jsonify({'error': '请求体应为数组'}), 400
@@ -1633,7 +1664,7 @@ def add_strategies():
         return jsonify({'message': 'success'}), 200
     except Exception as e:
         conn.rollback()
-        print(f"[ERROR] add_strategies: {e}")
+        logger.error(f"add_strategies 失败: {e}")
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
@@ -2162,11 +2193,14 @@ def get_strategy_returns(strategy_id):
 
         # 计算 T0 收益率（当日收盘市值相对成本）
         mv_t0 = 0.0
+        price_count_t0 = 0
         for info in stock_info:
             price_t0, _ = get_price_from_tushare(info['stock_code'], trade_date, 'close', auto_next=True)
             if price_t0:
                 mv_t0 += info['quantity'] * price_t0
-        t0_return = (mv_t0 / total_cost - 1) if total_cost > 0 else None
+                price_count_t0 += 1
+        # 只有当至少有一只股票获取到价格时，才计算收益率
+        t0_return = (mv_t0 / total_cost - 1) if total_cost > 0 and price_count_t0 > 0 else None
 
         # 计算 T1~T5 收益率
         returns = {}
@@ -2175,11 +2209,14 @@ def get_strategy_returns(strategy_id):
             for _ in range(offset):
                 target_d = get_next_trading_day(target_d, 'next')
             mv = 0.0
+            price_count = 0
             for info in stock_info:
                 price, _ = get_price_from_tushare(info['stock_code'], target_d, 'close', auto_next=True)
                 if price:
                     mv += info['quantity'] * price
-            returns[f'T{offset}'] = (mv / total_cost - 1) if total_cost > 0 else None
+                    price_count += 1
+            # 只有当至少有一只股票获取到价格时，才计算收益率
+            returns[f'T{offset}'] = (mv / total_cost - 1) if total_cost > 0 and price_count > 0 else None
 
         comp_list = [(info['stock_code'], info['quantity']) for info in stock_info]
         comp_str = '[' + ', '.join([f"({code},{qty})" for code, qty in comp_list]) + ']'
