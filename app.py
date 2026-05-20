@@ -727,7 +727,137 @@ def sync_daily_performance_to_dynamodb():
 
     print("[INFO] 每日表现同步完成")
 
-# ========== 交易执行 ==========
+
+# ========== DynamoDB Streams 拉模式消费 ==========
+DYNAMODB_SIGNAL_TABLE = os.environ.get('DYNAMODB_SIGNAL_TABLE', 'StrategyTradeSignal-g2tj2wqxmzfonj7635ifynetqu-NONE')
+_stream_iterator = None
+_last_sequence = None
+
+def _get_stream_iterator():
+    """获取或创建 DynamoDB Streams 迭代器"""
+    global _stream_iterator, _last_sequence
+    if _stream_iterator is not None:
+        return _stream_iterator
+
+    try:
+        client = boto3.client('dynamodbstreams', region_name=DYNAMODB_REGION)
+        # 查找表的 Stream ARN
+        streams = client.list_streams(TableName=DYNAMODB_SIGNAL_TABLE)
+        stream_arn = None
+        for s in streams.get('Streams', []):
+            if s['TableName'] == DYNAMODB_SIGNAL_TABLE:
+                stream_arn = s['StreamArn']
+                break
+
+        if not stream_arn:
+            print(f"[WARN] DynamoDB Streams 未启用: {DYNAMODB_SIGNAL_TABLE}")
+            return None
+
+        # 获取最新的 shard
+        desc = client.describe_stream(StreamArn=stream_arn)
+        shards = desc.get('StreamDescription', {}).get('Shards', [])
+        if not shards:
+            return None
+
+        shard_id = shards[0]['ShardId']
+
+        # 从最新位置开始（LATEST）或从上次记录的位置继续
+        if _last_sequence:
+            iterator_type = 'AFTER_SEQUENCE_NUMBER'
+            iterator_resp = client.get_shard_iterator(
+                StreamArn=stream_arn,
+                ShardId=shard_id,
+                ShardIteratorType=iterator_type,
+                SequenceNumber=_last_sequence,
+            )
+        else:
+            iterator_resp = client.get_shard_iterator(
+                StreamArn=stream_arn,
+                ShardId=shard_id,
+                ShardIteratorType='LATEST',
+            )
+
+        _stream_iterator = iterator_resp.get('ShardIterator')
+        return _stream_iterator
+    except Exception as e:
+        print(f"[ERROR] DynamoDB Streams 初始化失败: {e}")
+        return None
+
+
+def poll_dynamodb_signals():
+    """从 DynamoDB Streams 拉取新信号，自动提交到 Stock-Trace"""
+    global _stream_iterator, _last_sequence
+    iterator = _get_stream_iterator()
+    if not iterator:
+        return
+
+    try:
+        client = boto3.client('dynamodbstreams', region_name=DYNAMODB_REGION)
+        resp = client.get_records(ShardIterator=iterator, Limit=25)
+        _stream_iterator = resp.get('NextShardIterator')
+
+        records = resp.get('Records', [])
+        if not records:
+            return
+
+        signals_to_submit = []
+        for record in records:
+            if record.get('eventName') not in ('INSERT', 'MODIFY'):
+                continue
+            new_image = record.get('dynamodb', {}).get('NewImage', {})
+            if not new_image:
+                continue
+
+            # 解析 DynamoDB 属性
+            signal_type = new_image.get('signalType', {}).get('S', '')
+            status = new_image.get('status', {}).get('S', '')
+            strategy_id = new_image.get('strategyId', {}).get('S', '')
+            stock_code = new_image.get('stockCode', {}).get('S', '')
+            trade_date = new_image.get('tradeDate', {}).get('S', '')
+            quantity = new_image.get('quantity', {}).get('N', '0')
+
+            if status != 'pending' or signal_type not in ('buy', 'sell'):
+                continue
+
+            signals_to_submit.append({
+                'strategy_id': strategy_id,
+                'stock_code': stock_code,
+                'action': signal_type,
+                'quantity': int(quantity),
+                'date': trade_date,
+            })
+
+            _last_sequence = record.get('dynamodb', {}).get('SequenceNumber', _last_sequence)
+
+        if not signals_to_submit:
+            return
+
+        # 按策略分组提交
+        by_strategy = defaultdict(list)
+        for s in signals_to_submit:
+            by_strategy[s['strategy_id']].append(s)
+
+        for strategy_id, sigs in by_strategy.items():
+            payload = [{
+                'strategy_id': strategy_id,
+                'stocks': [{
+                    'stock_code': sig['stock_code'],
+                    'action': sig['action'],
+                    'quantity': sig['quantity'],
+                    'date': sig['date'],
+                } for sig in sigs]
+            }]
+            try:
+                # 通过内部 API 调用提交（不走网络）
+                with app.test_client() as client:
+                    resp = client.post('/api/strategies', json=payload)
+                    print(f"[INFO] 拉模式: 策略 {strategy_id} 提交 {len(sigs)} 个信号, 状态={resp.status_code}")
+            except Exception as e:
+                print(f"[ERROR] 拉模式提交失败: {e}")
+
+    except Exception as e:
+        print(f"[ERROR] DynamoDB Streams 轮询失败: {e}")
+        _stream_iterator = None  # 重置连接
 def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
                   target_datetime, order_type='daily_order', limit_price=None, cutoff_time=None):
     """
@@ -2033,6 +2163,9 @@ scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
 scheduler.add_job(func=process_limit_orders, trigger="interval", minutes=1)
 # 每日收盘后同步表现到 DynamoDB（北京时间 16:30，按服务器时区调整）
 scheduler.add_job(func=sync_daily_performance_to_dynamodb, trigger="cron", hour=16, minute=30)
+# 拉模式：每 30 秒轮询 DynamoDB Streams 获取新信号
+if os.environ.get('ENABLE_PULL_MODE', '').lower() == 'true':
+    scheduler.add_job(func=poll_dynamodb_signals, trigger="interval", seconds=30)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
