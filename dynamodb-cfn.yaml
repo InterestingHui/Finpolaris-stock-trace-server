@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Finpolaris - StrategyDailyPerformance DynamoDB Table + EC2 IAM Policy'
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev]
+
+Resources:
+  # DynamoDB 表：策略每日表现
+  StrategyDailyPerformanceTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Env}-StrategyDailyPerformance'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: strategyId
+          AttributeType: S
+        - AttributeName: tradeDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: strategyId
+          KeyType: HASH
+        - AttributeName: tradeDate
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: Finpolaris
+        - Key: Component
+          Value: Stock-Trace
+
+  # IAM Policy：EC2 写入 DynamoDB
+  StockTraceDynamoDBPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: 'Stock-Trace-Server DynamoDB write access for daily performance sync'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:BatchWriteItem
+            Resource: !GetAtt StrategyDailyPerformanceTable.Arn
+
+Outputs:
+  TableName:
+    Value: !Ref StrategyDailyPerformanceTable
+    Description: 'DynamoDB table name for strategy daily performance'
+  TableArn:
+    Value: !GetAtt StrategyDailyPerformanceTable.Arn
+    Description: 'DynamoDB table ARN'
+  PolicyArn:
+    Value: !Ref StockTraceDynamoDBPolicy
+    Description: 'IAM Managed Policy ARN - attach to EC2 IAM Role'
