@@ -9,6 +9,8 @@ import tushare as ts
 import akshare as ak
 import pandas as pd
 import baostock as bs
+import boto3
+from botocore.exceptions import ClientError
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import logging
@@ -37,6 +39,17 @@ DB_CONFIG = {
     'charset': 'utf8mb4',
     'cursorclass': pymysql.cursors.DictCursor
 }
+
+# ========== DynamoDB 配置 ==========
+DYNAMODB_REGION = os.environ.get('DYNAMODB_REGION', 'ap-northeast-1')
+DYNAMODB_PERFORMANCE_TABLE = os.environ.get('DYNAMODB_PERFORMANCE_TABLE', 'StrategyDailyPerformance')
+_dynamodb = None
+
+def get_dynamodb():
+    global _dynamodb
+    if _dynamodb is None:
+        _dynamodb = boto3.resource('dynamodb', region_name=DYNAMODB_REGION)
+    return _dynamodb
 
 def get_db():
     return pymysql.connect(**DB_CONFIG)
@@ -637,6 +650,82 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
         if price:
             market_value += qty * price
     return cash + market_value
+
+# ========== DynamoDB 每日表现同步 ==========
+def sync_daily_performance_to_dynamodb():
+    """每日收盘后将策略表现数据同步到 DynamoDB，供 Omnisight 读取"""
+    print("[INFO] 开始同步每日表现到 DynamoDB...")
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT strategy_id, initial_capital FROM strategies")
+            strategies = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not strategies:
+        print("[INFO] 没有策略需要同步")
+        return
+
+    table = get_dynamodb().Table(DYNAMODB_PERFORMANCE_TABLE)
+
+    for strategy in strategies:
+        strategy_id = strategy['strategy_id']
+        initial_capital = float(strategy['initial_capital'])
+        try:
+            # 使用最近交易日计算 NAV
+            target_date = today if is_trading_day(today) else yesterday
+            nav = get_strategy_nav_at_date(strategy_id, target_date, price_type='close')
+            if nav is None:
+                print(f"[WARN] 策略 {strategy_id} 无法计算 NAV，跳过")
+                continue
+
+            # 计算持仓
+            cash, positions = calculate_strategy_cash_and_positions(strategy_id)
+
+            # 构建持仓列表
+            holdings = []
+            if positions:
+                for stock_code, qty in positions.items():
+                    price = get_latest_price(stock_code, 'close')
+                    qty = float(qty)
+                    market_value = qty * price if price else 0
+                    holdings.append({
+                        'stockCode': stock_code,
+                        'quantity': int(qty),
+                        'price': round(price, 3) if price else 0,
+                        'marketValue': round(market_value, 2)
+                    })
+
+            nav_percent = round((nav / initial_capital) * 100, 2) if initial_capital > 0 else 0
+
+            # 计算昨日 NAV（用于日收益）
+            prev_nav = get_strategy_nav_at_date(strategy_id, yesterday, price_type='close')
+            daily_return = round(((nav - prev_nav) / prev_nav) * 100, 4) if prev_nav and prev_nav > 0 else None
+
+            item = {
+                'strategyId': strategy_id,
+                'tradeDate': target_date.strftime('%Y-%m-%d'),
+                'totalNav': round(nav, 2),
+                'navPercent': nav_percent,
+                'cashBalance': round(cash, 2) if cash is not None else 0,
+                'holdings': holdings,
+                'dailyReturn': daily_return,
+                'updatedAt': datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+            }
+
+            table.put_item(Item=item)
+            print(f"[INFO] 策略 {strategy_id} 表现已同步: NAV={round(nav, 2)}, NAV%={nav_percent}%")
+
+        except ClientError as e:
+            print(f"[ERROR] DynamoDB 写入失败 ({strategy_id}): {e}")
+        except Exception as e:
+            print(f"[ERROR] 同步策略 {strategy_id} 失败: {e}")
+
+    print("[INFO] 每日表现同步完成")
 
 # ========== 交易执行 ==========
 def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
@@ -1942,6 +2031,8 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(func=process_pending_orders, trigger="interval", seconds=30)
 # 新增：限价单处理，每分钟执行一次
 scheduler.add_job(func=process_limit_orders, trigger="interval", minutes=1)
+# 每日收盘后同步表现到 DynamoDB（北京时间 16:30，按服务器时区调整）
+scheduler.add_job(func=sync_daily_performance_to_dynamodb, trigger="cron", hour=16, minute=30)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
