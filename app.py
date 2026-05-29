@@ -1,8 +1,11 @@
 import os
 import sys
+from dotenv import load_dotenv
+load_dotenv()
 from collections import defaultdict
 from datetime import datetime, timedelta, date
 import pymysql
+from dbutils.pooled_db import PooledDB
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 import tushare as ts
@@ -11,11 +14,14 @@ import pandas as pd
 import baostock as bs
 import boto3
 from botocore.exceptions import ClientError
+from tablestore import OTSClient, Row, INF_MIN, INF_MAX
+import json as _json
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import logging
 from functools import lru_cache
 import random
+import time as _time
 
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
@@ -43,33 +49,63 @@ DB_CONFIG = {
 # ========== DynamoDB 配置 ==========
 DYNAMODB_REGION = os.environ.get('DYNAMODB_REGION', 'ap-northeast-1')
 DYNAMODB_PERFORMANCE_TABLE = os.environ.get('DYNAMODB_PERFORMANCE_TABLE', 'StrategyDailyPerformance')
-_dynamodb = None
 
-def get_dynamodb():
-    global _dynamodb
-    if _dynamodb is None:
-        _dynamodb = boto3.resource('dynamodb', region_name=DYNAMODB_REGION)
-    return _dynamodb
+# ========== 阿里云 TableStore 配置 ==========
+OTS_ENDPOINT = os.environ.get('OTS_ENDPOINT', 'https://finpolaris.cn-hongkong.ots.aliyuncs.com')
+OTS_INSTANCE = os.environ.get('OTS_INSTANCE', 'finpolaris')
+OTS_AK = os.environ.get('OTS_ACCESS_KEY_ID', '')
+OTS_SK = os.environ.get('OTS_ACCESS_KEY_SECRET', '')
+_ots_client = None
+
+def get_ots_client():
+    global _ots_client
+    if _ots_client is None:
+        _ots_client = OTSClient(
+            end_point=OTS_ENDPOINT,
+            access_key_id=OTS_AK,
+            access_key_secret=OTS_SK,
+            instance_name=OTS_INSTANCE,
+        )
+    return _ots_client
+
+_db_pool = None
 
 def get_db():
-    return pymysql.connect(**DB_CONFIG)
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = PooledDB(
+            creator=pymysql,
+            maxconnections=5,
+            mincached=1,
+            maxcached=3,
+            blocking=True,
+            ping=1,
+            **DB_CONFIG
+        )
+    return _db_pool.connection()
 
 # ========== 交易日历缓存 ==========
 _trade_calendar_cache = {}
+_trading_day_ordinal = {}  # date_str → sequential ordinal (only trading days)
 
 def load_trade_calendar(start_date: date = None, end_date: date = None):
-    """预加载指定区间的交易日历到内存"""
+    """预加载指定区间的交易日历到内存，并构建交易日序号表"""
     if start_date is None:
-        start_date = date.today() - timedelta(days=365)
+        start_date = date.today() - timedelta(days=730)
     if end_date is None:
-        end_date = date.today() + timedelta(days=365)
+        end_date = date.today() + timedelta(days=730)
     try:
         df = pro.trade_cal(exchange='SSE',
                            start_date=start_date.strftime('%Y%m%d'),
                            end_date=end_date.strftime('%Y%m%d'))
         for _, row in df.iterrows():
             _trade_calendar_cache[row['cal_date']] = (row['is_open'] == 1)
-        print(f"[交易日历] 成功加载 {len(_trade_calendar_cache)} 条记录")
+        # Build ordinal index: sorted trading days get sequential numbers
+        trading_days = sorted(d for d, is_open in _trade_calendar_cache.items() if is_open)
+        _trading_day_ordinal.clear()
+        for idx, d in enumerate(trading_days):
+            _trading_day_ordinal[d] = idx
+        print(f"[交易日历] 成功加载 {len(_trade_calendar_cache)} 条记录, {len(trading_days)} 个交易日")
     except Exception as e:
         print(f"[交易日历加载失败] {e}")
 
@@ -100,6 +136,12 @@ def get_next_trading_day(dt: date, direction='next') -> date:
     raise ValueError(f"无法找到 {direction} 交易日，起始日期 {dt}")
 
 def count_trading_days(start_date: date, end_date: date) -> int:
+    """计算两个日期之间的交易日数量。优先使用序号表 O(1)，fallback 到逐天遍历。"""
+    start_str = start_date.strftime('%Y%m%d')
+    end_str = end_date.strftime('%Y%m%d')
+    if start_str in _trading_day_ordinal and end_str in _trading_day_ordinal:
+        return _trading_day_ordinal[end_str] - _trading_day_ordinal[start_str] + 1
+    # Fallback: boundary dates outside pre-loaded range
     count = 0
     current = start_date
     while current <= end_date:
@@ -109,23 +151,56 @@ def count_trading_days(start_date: date, end_date: date) -> int:
     return count
 
 # ========== 价格获取 ==========
+def _ensure_ts_code(stock_code: str) -> str:
+    """确保股票代码带有交易所后缀 (000001 → 000001.SZ)"""
+    if '.' in stock_code:
+        return stock_code
+    return stock_code + '.SH' if stock_code.startswith('6') else stock_code + '.SZ'
+
 def get_price_from_tushare(stock_code, trade_date, price_type='open', auto_next=False):
-    if isinstance(trade_date, date):
-        trade_date = trade_date.strftime('%Y%m%d')
+    dt = trade_date if isinstance(trade_date, date) else datetime.strptime(trade_date, '%Y%m%d').date()
+    cached = _get_cached_daily(stock_code, dt)
+    if cached and cached.get(price_type):
+        return cached[price_type], dt
     try:
-        df = pro.daily(ts_code=stock_code, start_date=trade_date, end_date=trade_date)
+        ts_code = _ensure_ts_code(stock_code)
+        trade_str = dt.strftime('%Y%m%d')
+        df = pro.daily(ts_code=ts_code, start_date=trade_str, end_date=trade_str)
         if df.empty:
             if not auto_next:
                 return None, None
-            next_date = get_next_trading_day(datetime.strptime(trade_date, '%Y%m%d').date(), 'next')
+            next_date = get_next_trading_day(dt, 'next')
             next_str = next_date.strftime('%Y%m%d')
-            df = pro.daily(ts_code=stock_code, start_date=next_str, end_date=next_str)
+            cached_next = _get_cached_daily(stock_code, next_date)
+            if cached_next and cached_next.get(price_type):
+                return cached_next[price_type], next_date
+            df = pro.daily(ts_code=ts_code, start_date=next_str, end_date=next_str)
             if df.empty:
                 return None, None
             actual_date = next_date
         else:
-            actual_date = datetime.strptime(trade_date, '%Y%m%d').date()
+            actual_date = dt
         price = float(df.iloc[0][price_type])
+        # 异步写入缓存以填充 stock_daily_cache
+        row_data = df.iloc[0]
+        try:
+            _save_cached_daily(stock_code, actual_date, {
+                'open': float(row_data['open']),
+                'close': float(row_data['close']),
+                'high': float(row_data['high']),
+                'low': float(row_data['low']),
+                'vol': float(row_data.get('vol', 0) or 0),
+                'pct_chg': float(row_data.get('pct_chg', 0) or 0)
+            })
+        except Exception:
+            pass
+        # 同时更新内存缓存
+        td_str = actual_date.isoformat()
+        _daily_price_mem_cache[(stock_code, td_str)] = {
+            'data': {'open': float(row_data['open']), 'close': float(row_data['close']),
+                     'high': float(row_data['high']), 'low': float(row_data['low'])},
+            'ts': _time.time()
+        }
         return price, actual_date
     except Exception as e:
         print(f"[ERROR] get_price_from_tushare: {e}")
@@ -144,6 +219,12 @@ def get_limit_price(stock_code, trade_date):
         return None, None
 
 def get_latest_price(stock_code, price_type='close'):
+    today = date.today()
+    for offset in range(5):
+        d = today - timedelta(days=offset)
+        cached = _get_cached_daily(stock_code, d)
+        if cached and cached.get(price_type):
+            return cached[price_type]
     try:
         df = pro.daily(ts_code=stock_code, limit=1)
         if not df.empty:
@@ -152,57 +233,84 @@ def get_latest_price(stock_code, price_type='close'):
         print(f"get_latest_price error: {e}")
     return None
 
-# ========== 日线缓存 ==========
-def _get_cached_daily(stock_code: str, trade_date: date):
-    conn = get_db()
+# ========== 日线内存缓存层 ==========
+# 历史日线数据不可变，永久缓存；今天数据 60s TTL
+_daily_price_mem_cache = {}
+
+def _get_cached_daily(stock_code: str, trade_date: date, conn=None):
+    td_str = trade_date.isoformat() if isinstance(trade_date, date) else str(trade_date)
+    cache_key = (stock_code, td_str)
+    today_str = date.today().isoformat()
+
+    cached = _daily_price_mem_cache.get(cache_key)
+    if cached:
+        if td_str < today_str or (_time.time() - cached['ts']) < 60:
+            return cached['data'] if cached['data'] else None
+
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                SELECT open, close, high, low
+                SELECT open, close, high, low, vol, pct_chg
                 FROM stock_daily_cache
                 WHERE stock_code = %s AND trade_date = %s
             """, (stock_code, trade_date))
             row = cursor.fetchone()
             if row:
-                return {
+                result = {
                     'open': float(row['open']),
                     'close': float(row['close']),
                     'high': float(row['high']),
                     'low': float(row['low'])
                 }
+                if row.get('vol') is not None:
+                    result['vol'] = int(row['vol'])
+                if row.get('pct_chg') is not None:
+                    result['pct_chg'] = float(row['pct_chg'])
+                _daily_price_mem_cache[cache_key] = {'data': result, 'ts': _time.time()}
+                return result
     except Exception as e:
         print(f"[缓存] 读取日线失败: {e}")
     finally:
-        conn.close()
+        if _own_conn:
+            conn.close()
     return None
 
-def _save_cached_daily(stock_code: str, trade_date: date, data: dict):
-    conn = get_db()
+def _save_cached_daily(stock_code: str, trade_date: date, data: dict, conn=None):
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO stock_daily_cache 
-                (stock_code, trade_date, open, close, high, low)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO stock_daily_cache
+                (stock_code, trade_date, open, close, high, low, vol, pct_chg)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                open=VALUES(open), close=VALUES(close), high=VALUES(high), low=VALUES(low)
+                open=VALUES(open), close=VALUES(close), high=VALUES(high), low=VALUES(low),
+                vol=VALUES(vol), pct_chg=VALUES(pct_chg)
             """, (
                 stock_code, trade_date,
-                data['open'], data['close'], data['high'], data['low']
+                data['open'], data['close'], data['high'], data['low'],
+                data.get('vol'), data.get('pct_chg')
             ))
         conn.commit()
     except Exception as e:
         print(f"[缓存] 保存日线失败: {e}")
     finally:
-        conn.close()
+        if _own_conn:
+            conn.close()
 
-def fetch_stock_daily_info(stock_code: str, trade_date: date):
-    cached = _get_cached_daily(stock_code, trade_date)
+def fetch_stock_daily_info(stock_code: str, trade_date: date, conn=None):
+    cached = _get_cached_daily(stock_code, trade_date, conn=conn)
     if cached:
         return cached
     date_str = trade_date.strftime('%Y%m%d')
     try:
-        df = pro.daily(ts_code=stock_code, start_date=date_str, end_date=date_str)
+        ts_code = _ensure_ts_code(stock_code)
+        df = pro.daily(ts_code=ts_code, start_date=date_str, end_date=date_str)
         if df.empty:
             return None
         row = df.iloc[0]
@@ -210,13 +318,113 @@ def fetch_stock_daily_info(stock_code: str, trade_date: date):
             'open': float(row['open']),
             'close': float(row['close']),
             'high': float(row['high']),
-            'low': float(row['low'])
+            'low': float(row['low']),
+            'vol': int(row['vol']) if pd.notna(row.get('vol')) else None,
+            'pct_chg': float(row['pct_chg']) if pd.notna(row.get('pct_chg')) else None,
         }
-        _save_cached_daily(stock_code, trade_date, data)
+        _save_cached_daily(stock_code, trade_date, data, conn=conn)
         return data
     except Exception as e:
         print(f"[日线] Tushare 获取失败 {stock_code} {date_str}: {e}")
         return None
+
+# ========== 批量查询辅助函数（减少远程 MySQL 往返次数） ==========
+
+def _batch_fetch_daily_prices(stock_codes, dates, conn=None):
+    """一次性批量查询多只股票在多个日期的日线数据"""
+    if not stock_codes or not dates:
+        return {}
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            code_ph = ','.join(['%s'] * len(stock_codes))
+            date_ph = ','.join(['%s'] * len(dates))
+            cursor.execute(f"""
+                SELECT stock_code, trade_date, open, close, high, low, vol, pct_chg
+                FROM stock_daily_cache
+                WHERE stock_code IN ({code_ph}) AND trade_date IN ({date_ph})
+            """, (*stock_codes, *dates))
+            result = {}
+            for r in cursor.fetchall():
+                td = r['trade_date'].date() if isinstance(r['trade_date'], datetime) else r['trade_date']
+                result.setdefault(r['stock_code'], {})[td] = {
+                    'open': float(r['open']), 'close': float(r['close']),
+                    'high': float(r['high']), 'low': float(r['low'])
+                }
+            return result
+    except Exception as e:
+        print(f"[批量] 日线查询失败: {e}")
+        return {}
+    finally:
+        if _own_conn:
+            conn.close()
+
+
+def _batch_fetch_market_values(stock_codes, dates, conn=None):
+    """一次性批量查询多只股票在多个日期的市值"""
+    if not stock_codes or not dates:
+        return {}
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            code_ph = ','.join(['%s'] * len(stock_codes))
+            date_ph = ','.join(['%s'] * len(dates))
+            cursor.execute(f"""
+                SELECT stock_code, trade_date, total_mv
+                FROM stock_market_value_cache
+                WHERE stock_code IN ({code_ph}) AND trade_date IN ({date_ph})
+            """, (*stock_codes, *dates))
+            result = {}
+            for r in cursor.fetchall():
+                td = r['trade_date'].date() if isinstance(r['trade_date'], datetime) else r['trade_date']
+                result.setdefault(r['stock_code'], {})[td] = float(r['total_mv'])
+            return result
+    except Exception as e:
+        print(f"[批量] 市值查询失败: {e}")
+        return {}
+    finally:
+        if _own_conn:
+            conn.close()
+
+
+# 市值内存缓存 — 历史数据不可变，当天数据 120s TTL
+_market_value_cache = {}
+
+def _get_market_value_cached(stock_code, trade_date, conn=None):
+    """带内存缓存的市值查询，fallback 到 DB"""
+    today_str = date.today().isoformat()
+    td_str = trade_date.isoformat() if isinstance(trade_date, date) else str(trade_date)
+    cache_key = (stock_code, td_str)
+    cached = _market_value_cache.get(cache_key)
+    if cached:
+        if td_str < today_str or (_time.time() - cached['ts']) < 120:
+            return cached['value']
+
+    _own_conn = conn is None
+    if _own_conn:
+        conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT total_mv FROM stock_market_value_cache WHERE stock_code = %s AND trade_date = %s",
+                (stock_code, trade_date)
+            )
+            row = cursor.fetchone()
+            if row and row['total_mv'] is not None:
+                val = float(row['total_mv'])
+                _market_value_cache[cache_key] = {'value': val, 'ts': _time.time()}
+                return val
+    except Exception:
+        pass
+    finally:
+        if _own_conn:
+            conn.close()
+    return None
+
 
 # ========== 指数数据缓存 ==========
 _index_cache = {}  # 缓存指数数据，格式: {(index_code, start_date, end_date, price_type): data}
@@ -319,8 +527,21 @@ def _save_cached_name(stock_code: str, stock_name: str):
         conn.close()
 
 def init_stock_basic_cache():
-    """启动时从 Tushare 拉取全量股票基本信息，写入数据库缓存"""
-    print("[股票名称] 开始从 Tushare 初始化股票基本信息...")
+    """启动时检查缓存，仅在无数据时才从 Tushare 拉取全量股票基本信息"""
+    # 先检查缓存是否已有数据
+    try:
+        conn = get_db()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) AS cnt FROM stock_name_cache")
+            cnt = cursor.fetchone()['cnt']
+        conn.close()
+        if cnt > 1000:
+            print(f"[股票名称] 缓存已有 {cnt} 条记录，跳过 Tushare 初始化")
+            return
+    except Exception:
+        pass
+
+    print("[股票名称] 缓存为空，从 Tushare 初始化股票基本信息...")
     try:
         df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
         if df.empty:
@@ -588,32 +809,62 @@ def calculate_strategy_cash_and_positions(strategy_id):
     finally:
         conn.close()
 
+def _batch_latest_prices(stock_codes, price_type='close'):
+    """Batch-fetch latest prices for multiple stocks in a single Tushare call."""
+    prices = {}
+    # Try DB cache first
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ','.join(['%s'] * len(stock_codes))
+            cursor.execute(f"""
+                SELECT stock_code, open, close FROM stock_daily_cache
+                WHERE stock_code IN ({placeholders})
+                AND trade_date = (SELECT MAX(trade_date) FROM stock_daily_cache LIMIT 1)
+            """, tuple(stock_codes))
+            for r in cursor.fetchall():
+                prices[r['stock_code']] = float(r[price_type])
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+    missing = [c for c in stock_codes if c not in prices]
+    if missing:
+        try:
+            df = pro.daily(ts_code=','.join(missing), trade_date=date.today().strftime('%Y%m%d'))
+            if df.empty:
+                df = pro.daily(ts_code=','.join(missing), limit=1)
+            for _, row in df.iterrows():
+                prices[row['ts_code']] = float(row[price_type])
+        except Exception as e:
+            print(f"[NAV] 批量获取价格失败: {e}")
+            for code in missing:
+                if code not in prices:
+                    p = get_latest_price(code, price_type)
+                    if p:
+                        prices[code] = p
+    return prices
+
+
 def get_current_nav(strategy_id, stock_list=None, price_type='close'):
     cash, positions = calculate_strategy_cash_and_positions(strategy_id)
     if cash is None:
         return None
+    codes = list(positions.keys()) if stock_list is None else stock_list
+    prices = _batch_latest_prices(codes, price_type)
     if stock_list is None:
-        total_mv = 0.0
-        for stock_code, qty in positions.items():
-            qty = float(qty)
-            price = get_latest_price(stock_code, price_type)
-            if price:
-                total_mv += qty * price
+        total_mv = sum(float(qty) * prices.get(code, 0) for code, qty in positions.items())
         return cash + total_mv
     else:
-        result = []
-        for stock_code in stock_list:
-            qty = positions.get(stock_code, 0)
-            qty = float(qty)
-            if qty == 0:
-                result.append({'stock_code': stock_code, 'nav': 0.0})
-            else:
-                price = get_latest_price(stock_code, price_type)
-                nav = qty * price if price else 0.0
-                result.append({'stock_code': stock_code, 'nav': nav})
-        return result
+        return [
+            {'stock_code': code, 'nav': float(positions.get(code, 0)) * prices.get(code, 0)}
+            for code in stock_list
+        ]
 
-def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='close') -> float:
+def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='close',
+                              _prices=None, _trades=None) -> float:
+    """计算策略在指定日期的 NAV。支持外部传入预取的 _prices 和 _trades 避免重复查询。"""
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -622,18 +873,19 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
             if not row:
                 return None
             initial_capital = float(row['initial_capital'])
-            cursor.execute("""
-                SELECT trade_date, stock_code, action, quantity, price
-                FROM trades
-                WHERE strategy_id = %s AND trade_date <= %s
-                ORDER BY trade_date, id
-            """, (strategy_id, target_date))
-            trades = cursor.fetchall()
+            if _trades is None:
+                cursor.execute("""
+                    SELECT trade_date, stock_code, action, quantity, price
+                    FROM trades
+                    WHERE strategy_id = %s AND trade_date <= %s
+                    ORDER BY trade_date, id
+                """, (strategy_id, target_date))
+                _trades = cursor.fetchall()
     finally:
         conn.close()
     cash = initial_capital
     positions = defaultdict(float)
-    for t in trades:
+    for t in _trades:
         qty = float(t['quantity'])
         price = float(t['price'])
         if t['action'] == 'buy':
@@ -646,15 +898,25 @@ def get_strategy_nav_at_date(strategy_id: str, target_date: date, price_type='cl
                 del positions[t['stock_code']]
     market_value = 0.0
     for stock_code, qty in positions.items():
-        price, _ = get_price_from_tushare(stock_code, target_date, price_type, auto_next=True)
+        price = None
+        if _prices and stock_code in _prices:
+            td = target_date
+            for _offset in range(6):
+                entry = _prices[stock_code].get(td)
+                if entry and entry.get(price_type):
+                    price = entry[price_type]
+                    break
+                td = get_next_trading_day(td, 'prev')
+        if price is None:
+            price, _ = get_price_from_tushare(stock_code, target_date, price_type, auto_next=True)
         if price:
             market_value += qty * price
     return cash + market_value
 
 # ========== DynamoDB 每日表现同步 ==========
 def sync_daily_performance_to_dynamodb():
-    """每日收盘后将策略表现数据同步到 DynamoDB，供 Omnisight 读取"""
-    print("[INFO] 开始同步每日表现到 DynamoDB...")
+    """每日收盘后将策略表现数据同步到 TableStore，供 Omnisight 读取"""
+    print("[INFO] 开始同步每日表现到 TableStore...")
     today = date.today()
     yesterday = today - timedelta(days=1)
 
@@ -670,23 +932,20 @@ def sync_daily_performance_to_dynamodb():
         print("[INFO] 没有策略需要同步")
         return
 
-    table = get_dynamodb().Table(DYNAMODB_PERFORMANCE_TABLE)
+    ots = get_ots_client()
 
     for strategy in strategies:
         strategy_id = strategy['strategy_id']
         initial_capital = float(strategy['initial_capital'])
         try:
-            # 使用最近交易日计算 NAV
             target_date = today if is_trading_day(today) else yesterday
             nav = get_strategy_nav_at_date(strategy_id, target_date, price_type='close')
             if nav is None:
                 print(f"[WARN] 策略 {strategy_id} 无法计算 NAV，跳过")
                 continue
 
-            # 计算持仓
             cash, positions = calculate_strategy_cash_and_positions(strategy_id)
 
-            # 构建持仓列表
             holdings = []
             if positions:
                 for stock_code, qty in positions.items():
@@ -702,139 +961,123 @@ def sync_daily_performance_to_dynamodb():
 
             nav_percent = round((nav / initial_capital) * 100, 2) if initial_capital > 0 else 0
 
-            # 计算昨日 NAV（用于日收益）
             prev_nav = get_strategy_nav_at_date(strategy_id, yesterday, price_type='close')
             daily_return = round(((nav - prev_nav) / prev_nav) * 100, 4) if prev_nav and prev_nav > 0 else None
 
-            item = {
-                'strategyId': strategy_id,
-                'tradeDate': target_date.strftime('%Y-%m-%d'),
-                'totalNav': round(nav, 2),
-                'navPercent': nav_percent,
-                'cashBalance': round(cash, 2) if cash is not None else 0,
-                'holdings': holdings,
-                'dailyReturn': daily_return,
-                'updatedAt': datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-            }
-
-            table.put_item(Item=item)
+            pk = [('strategyId', strategy_id), ('tradeDate', target_date.strftime('%Y-%m-%d'))]
+            columns = [
+                ('totalNav', round(nav, 2)),
+                ('navPercent', nav_percent),
+                ('cashBalance', round(cash, 2) if cash is not None else 0),
+                ('holdings', _json.dumps(holdings, ensure_ascii=False)),
+                ('dailyReturn', daily_return if daily_return is not None else 0),
+                ('updatedAt', datetime.now().strftime('%Y-%m-%dT%H:%M:%S')),
+            ]
+            ots.put_row('StrategyDailyPerformance', Row(pk, columns))
             print(f"[INFO] 策略 {strategy_id} 表现已同步: NAV={round(nav, 2)}, NAV%={nav_percent}%")
 
-        except ClientError as e:
-            print(f"[ERROR] DynamoDB 写入失败 ({strategy_id}): {e}")
         except Exception as e:
             print(f"[ERROR] 同步策略 {strategy_id} 失败: {e}")
 
     print("[INFO] 每日表现同步完成")
 
 
-# ========== DynamoDB Streams 拉模式消费 ==========
-DYNAMODB_SIGNAL_TABLE = os.environ.get('DYNAMODB_SIGNAL_TABLE', 'StrategyTradeSignal-g2tj2wqxmzfonj7635ifynetqu-NONE')
-_stream_iterator = None
-_last_sequence = None
-
-def _get_stream_iterator():
-    """获取或创建 DynamoDB Streams 迭代器"""
-    global _stream_iterator, _last_sequence
-    if _stream_iterator is not None:
-        return _stream_iterator
-
-    try:
-        client = boto3.client('dynamodbstreams', region_name=DYNAMODB_REGION)
-        # 查找表的 Stream ARN
-        streams = client.list_streams(TableName=DYNAMODB_SIGNAL_TABLE)
-        stream_arn = None
-        for s in streams.get('Streams', []):
-            if s['TableName'] == DYNAMODB_SIGNAL_TABLE:
-                stream_arn = s['StreamArn']
-                break
-
-        if not stream_arn:
-            print(f"[WARN] DynamoDB Streams 未启用: {DYNAMODB_SIGNAL_TABLE}")
-            return None
-
-        # 获取最新的 shard
-        desc = client.describe_stream(StreamArn=stream_arn)
-        shards = desc.get('StreamDescription', {}).get('Shards', [])
-        if not shards:
-            return None
-
-        shard_id = shards[0]['ShardId']
-
-        # 从最新位置开始（LATEST）或从上次记录的位置继续
-        if _last_sequence:
-            iterator_type = 'AFTER_SEQUENCE_NUMBER'
-            iterator_resp = client.get_shard_iterator(
-                StreamArn=stream_arn,
-                ShardId=shard_id,
-                ShardIteratorType=iterator_type,
-                SequenceNumber=_last_sequence,
-            )
-        else:
-            iterator_resp = client.get_shard_iterator(
-                StreamArn=stream_arn,
-                ShardId=shard_id,
-                ShardIteratorType='LATEST',
-            )
-
-        _stream_iterator = iterator_resp.get('ShardIterator')
-        return _stream_iterator
-    except Exception as e:
-        print(f"[ERROR] DynamoDB Streams 初始化失败: {e}")
-        return None
-
+# ========== TableStore 信号轮询（替代 DynamoDB Streams）==========
+OTS_SIGNAL_TABLE = os.environ.get('OTS_SIGNAL_TABLE', 'StrategyTradeSignal')
 
 def poll_dynamodb_signals():
-    """从 DynamoDB Streams 拉取新信号，自动提交到 Stock-Trace"""
-    global _stream_iterator, _last_sequence
-    iterator = _get_stream_iterator()
-    if not iterator:
-        return
+    """从 TableStore 轮询待处理信号，自动提交到 Stock-Trace"""
+    from technical_indicators import compute_technical_profile, check_signal_confirmation
+    from signal_scorer import compute_composite_score
 
+    ots = get_ots_client()
     try:
-        client = boto3.client('dynamodbstreams', region_name=DYNAMODB_REGION)
-        resp = client.get_records(ShardIterator=iterator, Limit=25)
-        _stream_iterator = resp.get('NextShardIterator')
+        # 扫描所有 strategyId 下 status=pending 的信号
+        # TableStore 不支持二级索引过滤，用 get_range 全扫后在应用层过滤
+        inclusive_start = [('strategyId', INF_MIN), ('signalId', INF_MIN)]
+        exclusive_end = [('strategyId', INF_MAX), ('signalId', INF_MAX)]
 
-        records = resp.get('Records', [])
-        if not records:
-            return
+        _, _, rows, _ = ots.get_range(
+            OTS_SIGNAL_TABLE,
+            'FORWARD',
+            inclusive_start,
+            exclusive_end,
+            limit=50,
+        )
 
         signals_to_submit = []
-        for record in records:
-            if record.get('eventName') not in ('INSERT', 'MODIFY'):
-                continue
-            new_image = record.get('dynamodb', {}).get('NewImage', {})
-            if not new_image:
-                continue
+        processed_pks = []
+        rejected_pks = []
+        for row in rows:
+            pk_dict = {k: v for k, v in row.primary_key}
+            attrs = {col.column_name: col.column_value for col in row.attribute_columns}
 
-            # 解析 DynamoDB 属性
-            signal_type = new_image.get('signalType', {}).get('S', '')
-            status = new_image.get('status', {}).get('S', '')
-            strategy_id = new_image.get('strategyId', {}).get('S', '')
-            stock_code = new_image.get('stockCode', {}).get('S', '')
-            trade_date = new_image.get('tradeDate', {}).get('S', '')
-            quantity = new_image.get('quantity', {}).get('N', '0')
-
+            status = attrs.get('status', '')
+            signal_type = attrs.get('signalType', '')
             if status != 'pending' or signal_type not in ('buy', 'sell'):
                 continue
 
-            signals_to_submit.append({
-                'strategy_id': strategy_id,
-                'stock_code': stock_code,
+            sig = {
+                'strategy_id': pk_dict.get('strategyId', ''),
+                'stock_code': attrs.get('stockCode', ''),
                 'action': signal_type,
-                'quantity': int(quantity),
-                'date': trade_date,
-            })
-
-            _last_sequence = record.get('dynamodb', {}).get('SequenceNumber', _last_sequence)
+                'quantity': int(attrs.get('quantity', 0)),
+                'date': attrs.get('tradeDate', ''),
+                'raw_score': float(attrs.get('score', 0) or 0),
+                'pk': row.primary_key,
+            }
+            signals_to_submit.append(sig)
+            processed_pks.append(row.primary_key)
 
         if not signals_to_submit:
             return
 
+        # ===== 技术面过滤（仅 BUY 信号） =====
+        filtered_signals = []
+        today = date.today()
+        for sig in signals_to_submit:
+            if sig['action'] == 'sell':
+                filtered_signals.append(sig)
+                continue
+
+            stock_code = sig['stock_code']
+            trade_dt = today
+            if sig.get('date'):
+                try:
+                    trade_dt = datetime.strptime(str(sig['date']), '%Y-%m-%d').date()
+                except (ValueError, TypeError):
+                    pass
+
+            profile = compute_technical_profile(stock_code, trade_dt)
+            confirmation = check_signal_confirmation(stock_code, trade_dt)
+            scoring = compute_composite_score(sig.get('raw_score', 0), profile,
+                                              confirmation=confirmation,
+                                              stock_code=stock_code, trade_date=trade_dt)
+
+            # 记录分析结果到 MySQL
+            _save_technical_analysis(sig, profile, scoring)
+
+            if scoring['rejected']:
+                print(f"[技术过滤] 拒绝 BUY {stock_code}: {scoring['rejection_reason']} "
+                      f"(舆情={sig.get('raw_score', 0):.0f}, RSI={profile.get('rsi', 0):.1f})")
+                rejected_pks.append(sig['pk'])
+                continue
+
+            sig['composite_score'] = scoring['composite_score']
+            filtered_signals.append(sig)
+
+        # 按复合分排序 BUY 信号（SELL 信号保持原序）
+        buy_sigs = [s for s in filtered_signals if s['action'] == 'buy']
+        sell_sigs = [s for s in filtered_signals if s['action'] == 'sell']
+        buy_sigs.sort(key=lambda s: s.get('composite_score', 0), reverse=True)
+        filtered_signals = sell_sigs + buy_sigs
+
+        print(f"[技术过滤] 通过 {len(filtered_signals)}/{len(signals_to_submit)} "
+              f"(拒绝 {len(rejected_pks)})")
+
         # 按策略分组提交
         by_strategy = defaultdict(list)
-        for s in signals_to_submit:
+        for s in filtered_signals:
             by_strategy[s['strategy_id']].append(s)
 
         for strategy_id, sigs in by_strategy.items():
@@ -848,16 +1091,95 @@ def poll_dynamodb_signals():
                 } for sig in sigs]
             }]
             try:
-                # 通过内部 API 调用提交（不走网络）
-                with app.test_client() as client:
-                    resp = client.post('/api/strategies', json=payload)
+                with app.test_client() as tc:
+                    resp = tc.post('/api/strategies', json=payload)
                     print(f"[INFO] 拉模式: 策略 {strategy_id} 提交 {len(sigs)} 个信号, 状态={resp.status_code}")
             except Exception as e:
                 print(f"[ERROR] 拉模式提交失败: {e}")
 
+        # 将已处理的信号标记为 processed
+        for pk in processed_pks:
+            if pk in rejected_pks:
+                try:
+                    ots.update_row(OTS_SIGNAL_TABLE, Row(pk, [('status', 'rejected')]))
+                except Exception:
+                    pass
+            else:
+                try:
+                    ots.update_row(OTS_SIGNAL_TABLE, Row(pk, [('status', 'processed')]))
+                except Exception:
+                    pass
+
     except Exception as e:
-        print(f"[ERROR] DynamoDB Streams 轮询失败: {e}")
-        _stream_iterator = None  # 重置连接
+        print(f"[ERROR] TableStore 信号轮询失败: {e}")
+
+
+def _save_technical_analysis(sig, profile, scoring):
+    """保存信号技术分析结果到 MySQL"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            import json as _json_mod
+            cursor.execute("""
+                INSERT INTO signal_technical_analysis
+                (strategy_id, stock_code, trade_date, raw_sentiment_score,
+                 rsi_14, volume_ratio, ma5, ma20, ma_trend, momentum_5d_pct,
+                 macd_line, macd_signal, macd_hist, macd_cross, macd_score,
+                 bb_percent_b, bb_bandwidth, bb_score,
+                 relative_strength_10d, rs_score,
+                 kdj_k, kdj_d, kdj_j, kdj_cross, kdj_score,
+                 technical_score, composite_score, overheat_penalty,
+                 rejection_reason, filter_result, components_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                rsi_14=VALUES(rsi_14), volume_ratio=VALUES(volume_ratio),
+                ma5=VALUES(ma5), ma20=VALUES(ma20), ma_trend=VALUES(ma_trend),
+                momentum_5d_pct=VALUES(momentum_5d_pct),
+                macd_line=VALUES(macd_line), macd_signal=VALUES(macd_signal),
+                macd_hist=VALUES(macd_hist), macd_cross=VALUES(macd_cross),
+                macd_score=VALUES(macd_score),
+                bb_percent_b=VALUES(bb_percent_b), bb_bandwidth=VALUES(bb_bandwidth),
+                bb_score=VALUES(bb_score),
+                relative_strength_10d=VALUES(relative_strength_10d), rs_score=VALUES(rs_score),
+                kdj_k=VALUES(kdj_k), kdj_d=VALUES(kdj_d), kdj_j=VALUES(kdj_j),
+                kdj_cross=VALUES(kdj_cross), kdj_score=VALUES(kdj_score),
+                technical_score=VALUES(technical_score),
+                composite_score=VALUES(composite_score),
+                overheat_penalty=VALUES(overheat_penalty),
+                rejection_reason=VALUES(rejection_reason),
+                filter_result=VALUES(filter_result),
+                components_json=VALUES(components_json)
+            """, (
+                sig['strategy_id'], sig['stock_code'],
+                sig.get('date', date.today()),
+                scoring.get('sentiment_raw', 0),
+                profile.get('rsi', 50),
+                profile.get('volume_ratio', 1.0),
+                profile.get('ma5', 0), profile.get('ma20', 0),
+                profile.get('ma_trend', 'neutral'),
+                profile.get('momentum_5d_pct', 0),
+                profile.get('macd_line', 0), profile.get('macd_signal', 0),
+                profile.get('macd_hist', 0), profile.get('macd_cross', 'none'),
+                profile.get('macd_score', 40),
+                profile.get('bb_percent_b', 0.5), profile.get('bb_bandwidth', 0),
+                profile.get('bb_score', 50),
+                profile.get('relative_strength_10d', 0), profile.get('rs_score', 50),
+                profile.get('kdj_k', 50), profile.get('kdj_d', 50),
+                profile.get('kdj_j', 50), profile.get('kdj_cross', 'none'),
+                profile.get('kdj_score', 50),
+                scoring.get('technical_score', 50),
+                scoring.get('composite_score', 0),
+                scoring.get('overheat_penalty', 0),
+                scoring.get('rejection_reason', ''),
+                'rejected' if scoring.get('rejected') else 'passed',
+                _json_mod.dumps(scoring.get('components', {}), ensure_ascii=False),
+            ))
+        conn.commit()
+    except Exception as e:
+        print(f"[技术分析] 保存到 MySQL 失败: {e}")
+    finally:
+        conn.close()
 def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
                   target_datetime, order_type='daily_order', limit_price=None, cutoff_time=None):
     """
@@ -1427,6 +1749,18 @@ def execute_limit_order_fill(log_id, strategy_id, stock_code, trade_id, action, 
 def index():
     return render_template('index.html')
 
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        conn = get_db()
+        conn.ping()
+        conn.close()
+        return jsonify({'status': 'ok', 'db': 'connected'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'db': str(e)}), 503
+
+
 @app.route('/api/strategies', methods=['POST'])
 def add_strategies():
     print("[DEBUG] POST /api/strategies")
@@ -1580,18 +1914,29 @@ def add_strategies():
     finally:
         conn.close()
 
+# 策略列表缓存 — 很少变化，60s TTL
+_strategies_list_cache = {'data': None, 'ts': 0}
+
 @app.route('/api/strategies', methods=['GET'])
 def list_strategies():
+    if _time.time() - _strategies_list_cache['ts'] < 60 and _strategies_list_cache['data'] is not None:
+        return jsonify(_strategies_list_cache['data'])
     conn = get_db()
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT strategy_id FROM strategies")
             rows = cursor.fetchall()
-        return jsonify([r['strategy_id'] for r in rows])
+        result = [r['strategy_id'] for r in rows]
+        _strategies_list_cache['data'] = result
+        _strategies_list_cache['ts'] = _time.time()
+        return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
         conn.close()
+
+# NAV 历史缓存 — 历史区间永久缓存，含今天的区间 120s TTL
+_nav_cache = {}
 
 @app.route('/api/strategies/<strategy_id>/nav', methods=['GET'])
 def get_strategy_nav_history(strategy_id):
@@ -1600,6 +1945,14 @@ def get_strategy_nav_history(strategy_id):
     price_type = request.args.get('price_type', 'open')
     if price_type not in ['open', 'close']:
         price_type = 'open'
+
+    # 缓存检查
+    cache_key = (strategy_id, start_date_str or '__none', end_date_str, price_type)
+    today_str = date.today().isoformat()
+    cached = _nav_cache.get(cache_key)
+    if cached:
+        if end_date_str < today_str or (_time.time() - cached['ts']) < 120:
+            return jsonify(cached['result'])
 
     try:
         end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
@@ -1653,19 +2006,39 @@ def get_strategy_nav_history(strategy_id):
         dates.append(current)
         current += timedelta(days=1)
 
+    # 优先从数据库缓存批量获取价格，miss 的再从 Tushare 补
     price_cache = {}
-    for stock_code in stock_codes:
-        start_str = start_date.strftime('%Y%m%d')
-        end_str = end_date.strftime('%Y%m%d')
-        try:
-            df = pro.daily(ts_code=stock_code, start_date=start_str, end_date=end_str)
-            if not df.empty:
-                for _, row in df.iterrows():
-                    trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
-                    price = float(row[price_type])
-                    price_cache[(stock_code, trade_date)] = price
-        except Exception as e:
-            print(f"[ERROR] 获取 {stock_code} 价格失败: {e}")
+    batch_prices = _batch_fetch_daily_prices(stock_codes, dates)
+    for sc in stock_codes:
+        sc_prices = batch_prices.get(sc, {})
+        for td, pdata in sc_prices.items():
+            if pdata.get(price_type):
+                price_cache[(sc, td)] = float(pdata[price_type])
+
+    # Tushare 补充缺失的
+    missing_by_stock = defaultdict(list)
+    for sc in stock_codes:
+        for d in dates:
+            if (sc, d) not in price_cache:
+                missing_by_stock[sc].append(d)
+    if missing_by_stock:
+        for stock_code, miss_dates in missing_by_stock.items():
+            if not miss_dates:
+                continue
+            miss_dates.sort()
+            start_str = miss_dates[0].strftime('%Y%m%d')
+            end_str = miss_dates[-1].strftime('%Y%m%d')
+            # Tushare需要ts_code格式(如000001.SZ)
+            ts_code = _ensure_ts_code(stock_code)
+            try:
+                df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+                if not df.empty:
+                    for _, row in df.iterrows():
+                        trade_date = datetime.strptime(row['trade_date'], '%Y%m%d').date()
+                        price = float(row[price_type])
+                        price_cache[(stock_code, trade_date)] = price
+            except Exception as e:
+                print(f"[ERROR] Tushare 获取 {stock_code} 价格失败: {e}")
 
     conn = get_db()
     try:
@@ -1768,6 +2141,7 @@ def get_strategy_nav_history(strategy_id):
             if (stock_code, d) in price_cache:
                 last_price[stock_code] = price_cache[(stock_code, d)]
 
+    _nav_cache[cache_key] = {'result': result, 'ts': _time.time()}
     return jsonify(result)
 
 @app.route('/api/strategies/<strategy_id>/current_nav', methods=['GET'])
@@ -1814,6 +2188,20 @@ def get_index_data(index_code):
 
     return jsonify(result)
 
+# ========== Returns 结果缓存 ==========
+# 历史区间数据不可变，永久缓存；含今天的区间 120s TTL
+_returns_cache = {}
+
+# ========== Holdings 结果缓存 ==========
+_holdings_cache = {}  # (strategy_id, date_str, price_type) → {'result': ..., 'ts': timestamp}
+
+def _clean_holdings_cache():
+    """Evict entries older than 1 hour (today entries expire; historical ones are cheap to refill)."""
+    cutoff = _time.time() - 3600
+    stale = [k for k, v in _holdings_cache.items() if v['ts'] < cutoff]
+    for k in stale:
+        del _holdings_cache[k]
+
 @app.route('/api/strategies/<strategy_id>/holdings', methods=['GET'])
 def get_strategy_holdings_at_date(strategy_id):
     date_str = request.args.get('date')
@@ -1824,11 +2212,20 @@ def get_strategy_holdings_at_date(strategy_id):
         target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
     except:
         return jsonify({'error': '日期格式错误'}), 400
+
+    # Cache: historical dates are immutable, today gets 60s TTL
+    cache_key = (strategy_id, date_str, price_type)
+    cached = _holdings_cache.get(cache_key)
+    if cached:
+        today = date.today().isoformat()
+        if date_str < today or (_time.time() - cached['ts']) < 60:
+            return jsonify(cached['result'])
+
     display_date = target_date
     if not is_trading_day(target_date):
         target_date = get_next_trading_day(target_date, 'prev')
     # 将 target_date 转换为 datetime 类型以匹配数据库中的 trade_date 字段
-    target_datetime = datetime.combine(target_date, datetime.min.time()) if isinstance(target_date, date) else target_date
+    target_datetime = datetime.combine(target_date, datetime.max.time()) if isinstance(target_date, date) else target_date
     conn = get_db()
     try:
         with conn.cursor() as cursor:
@@ -1850,53 +2247,113 @@ def get_strategy_holdings_at_date(strategy_id):
                 WHERE strategy_id = %s AND status='pending' AND target_date = %s
             """, (strategy_id, target_date))
             pending_orders = cursor.fetchall()
+
+        cash = initial_capital
+        positions = defaultdict(float)
+        stock_batches = defaultdict(list)
+        for t in trades:
+            qty = float(t['quantity'])
+            price = float(t['price'])
+            trade_date = t['trade_date']
+            if t['action'] == 'buy':
+                cash -= qty * price
+                positions[t['stock_code']] += qty
+                stock_batches[t['stock_code']].append({'quantity': qty, 'buy_date': trade_date})
+            else:
+                cash += qty * price
+                remaining_sell = qty
+                batches = stock_batches[t['stock_code']]
+                while remaining_sell > 0 and batches:
+                    first_batch = batches[0]
+                    if first_batch['quantity'] > remaining_sell:
+                        first_batch['quantity'] -= remaining_sell
+                        remaining_sell = 0
+                    else:
+                        remaining_sell -= first_batch['quantity']
+                        batches.pop(0)
+                positions[t['stock_code']] -= qty
+                if positions[t['stock_code']] == 0:
+                    del positions[t['stock_code']]
+                    stock_batches[t['stock_code']] = []
+
+        # Batch fetch daily prices in a single DB query (reuse connection)
+        price_cache = {}
+        if positions:
+            stock_codes = list(positions.keys())
+            next_td = get_next_trading_day(target_date, 'next')
+            dates_needed = [target_date, next_td]
+            with conn.cursor() as cursor:
+                placeholders = ','.join(['%s'] * len(stock_codes))
+                date_placeholders = ','.join(['%s'] * len(dates_needed))
+                cursor.execute(f"""
+                    SELECT stock_code, trade_date, open, close, high, low, vol, pct_chg
+                    FROM stock_daily_cache
+                    WHERE stock_code IN ({placeholders}) AND trade_date IN ({date_placeholders})
+                """, (*stock_codes, *dates_needed))
+                for r in cursor.fetchall():
+                    key = r['stock_code']
+                    price_cache.setdefault(key, {})
+                    price_cache[key][r['trade_date']] = {
+                        'open': float(r['open']),
+                        'close': float(r['close']),
+                    }
+
+            # Fill from cache, batch-fetch missing from Tushare in one call
+            missing_codes = []
+            for stock_code in stock_codes:
+                cached = price_cache.get(stock_code, {}).get(target_date)
+                if not cached:
+                    cached = price_cache.get(stock_code, {}).get(next_td)
+                if cached:
+                    price_cache[stock_code] = {'_price': cached}
+                else:
+                    missing_codes.append(stock_code)
+
+            if missing_codes:
+                date_strs = [target_date.strftime('%Y%m%d'), next_td.strftime('%Y%m%d')]
+                try:
+                    df = pro.daily(
+                        ts_code=','.join(missing_codes),
+                        start_date=min(date_strs),
+                        end_date=max(date_strs),
+                    )
+                    if not df.empty:
+                        for _, row in df.iterrows():
+                            code = row['ts_code']
+                            td = row['trade_date']
+                            if code not in price_cache or '_price' not in price_cache[code]:
+                                price_cache[code] = {'_price': {
+                                    'open': float(row['open']),
+                                    'close': float(row['close']),
+                                    'high': float(row['high']),
+                                    'low': float(row['low']),
+                                }}
+                except Exception as e:
+                    print(f"[Holdings] 批量获取价格失败, 回退逐个获取: {e}")
+                    for stock_code in missing_codes:
+                        if stock_code not in price_cache or '_price' not in price_cache.get(stock_code, {}):
+                            daily = fetch_stock_daily_info(stock_code, target_date, conn=conn)
+                            if daily is None:
+                                daily = fetch_stock_daily_info(stock_code, next_td, conn=conn)
+                            if daily:
+                                price_cache[stock_code] = {'_price': daily}
     finally:
         conn.close()
 
-    cash = initial_capital
-    positions = defaultdict(float)
-    stock_batches = defaultdict(list)
-    for t in trades:
-        qty = float(t['quantity'])
-        price = float(t['price'])
-        trade_date = t['trade_date']
-        if t['action'] == 'buy':
-            cash -= qty * price
-            positions[t['stock_code']] += qty
-            stock_batches[t['stock_code']].append({'quantity': qty, 'buy_date': trade_date})
-        else:
-            cash += qty * price
-            remaining_sell = qty
-            batches = stock_batches[t['stock_code']]
-            while remaining_sell > 0 and batches:
-                first_batch = batches[0]
-                if first_batch['quantity'] > remaining_sell:
-                    first_batch['quantity'] -= remaining_sell
-                    remaining_sell = 0
-                else:
-                    remaining_sell -= first_batch['quantity']
-                    batches.pop(0)
-            positions[t['stock_code']] -= qty
-            if positions[t['stock_code']] == 0:
-                del positions[t['stock_code']]
-                stock_batches[t['stock_code']] = []
-
-    price_cache_open = {}
-    price_cache_close = {}
-    for stock_code in positions.keys():
-        price_open, _ = get_price_from_tushare(stock_code, target_date, 'open', auto_next=True)
-        if price_open:
-            price_cache_open[stock_code] = price_open
-        price_close, _ = get_price_from_tushare(stock_code, target_date, 'close', auto_next=True)
-        if price_close:
-            price_cache_close[stock_code] = price_close
+    # Resolve prices from cache
+    resolved_prices = {}
+    for code in positions:
+        entry = price_cache.get(code, {})
+        if '_price' in entry:
+            resolved_prices[code] = entry['_price']
 
     total_mv_open = 0.0
     total_mv_close = 0.0
     holdings_list = []
     for stock_code, qty in positions.items():
-        price_open = price_cache_open.get(stock_code)
-        price_close = price_cache_close.get(stock_code)
+        daily = resolved_prices.get(stock_code, {})
+        price_open = daily.get('open')
+        price_close = daily.get('close')
         mv_open = qty * (price_open if price_open else 0)
         mv_close = qty * (price_close if price_close else 0)
         total_mv_open += mv_open
@@ -1930,14 +2387,16 @@ def get_strategy_holdings_at_date(strategy_id):
         'target_date': target_date.strftime('%Y-%m-%d')
     } for p in pending_orders]
 
-    return jsonify({
+    result = {
         'date': display_date.strftime('%Y-%m-%d'),
         'cash': round(cash, 2),
         'nav': round(nav, 2),
         'nav_percent': round(nav_percent, 2),
         'holdings': holdings_list,
         'pending_orders': pending_list
-    })
+    }
+    _holdings_cache[cache_key] = {'result': result, 'ts': _time.time()}
+    return jsonify(result)
 
 @app.route('/api/strategies/<strategy_id>/trades', methods=['GET'])
 def get_strategy_trades(strategy_id):
@@ -2033,13 +2492,21 @@ def get_strategy_returns(strategy_id):
     except:
         return jsonify({'error': '日期格式错误'}), 400
 
-    # 将 start_date 和 end_date 转换为 datetime 类型，以匹配数据库中的 trade_date 字段
-    start_datetime = datetime.combine(start_date, datetime.min.time()) if isinstance(start_date, date) else start_date
-    end_datetime = datetime.combine(end_date, datetime.max.time()) if isinstance(end_date, date) else end_date
+    # 缓存：历史区间永久缓存，含今天的区间 120s TTL
+    cache_key = (strategy_id, start_date_str, end_date_str)
+    today_str = date.today().isoformat()
+    cached = _returns_cache.get(cache_key)
+    if cached:
+        if end_date_str < today_str or (_time.time() - cached['ts']) < 120:
+            return jsonify(cached['result'])
+
+    start_datetime = datetime.combine(start_date, datetime.min.time())
+    end_datetime = datetime.combine(end_date, datetime.max.time())
 
     conn = get_db()
     try:
         with conn.cursor() as cursor:
+            # 1. 获取所有买入交易（一次查询）
             cursor.execute("""
                 SELECT trade_date, stock_code, quantity, price, amount
                 FROM trades
@@ -2048,20 +2515,58 @@ def get_strategy_returns(strategy_id):
                 ORDER BY trade_date, stock_code
             """, (strategy_id, start_datetime, end_datetime))
             trades = cursor.fetchall()
+
+            if not trades:
+                return jsonify([])
+
+            # 2. 获取 initial_capital（一次查询）
+            cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            row = cursor.fetchone()
+            initial_capital = float(row['initial_capital']) if row else 0
+
+            # 3. 收集所有需要的 stock_code 和 date
+            all_stocks = list(set(t['stock_code'] for t in trades))
+            all_dates_set = set()
+            for t in trades:
+                td = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
+                all_dates_set.add(td)
+                # 收集 T0-T5 偏移日期
+                for offset in range(6):
+                    d = td
+                    for _ in range(offset):
+                        d = get_next_trading_day(d, 'next')
+                    all_dates_set.add(d)
+                # prev trade date for NAV
+                all_dates_set.add(get_next_trading_day(td, 'prev'))
+
+            all_dates = list(all_dates_set)
+
+            # 4. 批量获取价格（一次查询替代 N×M 次独立查询）
+            batch_prices = _batch_fetch_daily_prices(all_stocks, all_dates, conn=conn)
+
+            # 5. 批量获取市值（一次查询替代 N×M 次独立查询）
+            batch_mv = _batch_fetch_market_values(all_stocks, all_dates, conn=conn)
+
+            # 6. 获取所有交易记录用于 NAV 计算（一次查询）
+            cursor.execute("""
+                SELECT trade_date, stock_code, action, quantity, price
+                FROM trades
+                WHERE strategy_id = %s AND trade_date <= %s
+                ORDER BY trade_date, id
+            """, (strategy_id, end_datetime))
+            all_trades_for_nav = cursor.fetchall()
     finally:
         conn.close()
 
-    if not trades:
-        return jsonify([])
+    # ---- 以下全部在内存中计算，0 次 DB 查询 ----
 
     groups = defaultdict(list)
     for t in trades:
-        # 使用 trade_date 的 date 部分作为字典键，确保类型一致
-        trade_date_key = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
-        groups[trade_date_key].append(t)
+        td = t['trade_date'].date() if isinstance(t['trade_date'], datetime) else t['trade_date']
+        groups[td].append(t)
 
     result = []
-    for trade_date, group_trades in groups.items():
+    for trade_date, group_trades in sorted(groups.items()):
         total_cost = 0.0
         stock_info = []
         for t in group_trades:
@@ -2076,20 +2581,25 @@ def get_strategy_returns(strategy_id):
                 'cost': cost
             })
 
+        # 用预取价格计算 prev NAV
         prev_trade_date = get_next_trading_day(trade_date, 'prev')
-        prev_nav = get_strategy_nav_at_date(strategy_id, prev_trade_date, 'close')
+        prev_nav = get_strategy_nav_at_date(strategy_id, prev_trade_date, 'close',
+                                            _prices=batch_prices, _trades=all_trades_for_nav)
         if prev_nav is None:
-            conn = get_db()
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
-                prev_nav = float(cursor.fetchone()['initial_capital'])
-            conn.close()
+            prev_nav = initial_capital
         turnover = total_cost / prev_nav if prev_nav > 0 else 0.0
 
+        # 市值 — 优先从批量结果获取，fallback 到内存缓存
         mv_list = []
         weighted_mv_sum = 0.0
         for info in stock_info:
-            mv = get_stock_market_value(info['stock_code'], trade_date)
+            mv = None
+            sc = info['stock_code']
+            stock_mv = batch_mv.get(sc, {})
+            if trade_date in stock_mv:
+                mv = stock_mv[trade_date]
+            else:
+                mv = _get_market_value_cached(sc, trade_date, conn=None)
             if mv is not None:
                 mv_list.append(mv)
                 weighted_mv_sum += mv * info['cost']
@@ -2107,15 +2617,23 @@ def get_strategy_returns(strategy_id):
             else:
                 holding_size_median = (sorted_mvs[n // 2 - 1] + sorted_mvs[n // 2]) / 2
 
-        # 计算 T0 收益率（当日收盘市值相对成本）
+        # T0 收益率
         mv_t0 = 0.0
         for info in stock_info:
-            price_t0, _ = get_price_from_tushare(info['stock_code'], trade_date, 'close', auto_next=True)
+            sc = info['stock_code']
+            price_t0 = None
+            stock_prices = batch_prices.get(sc, {})
+            if trade_date in stock_prices:
+                price_t0 = stock_prices[trade_date].get('close')
+            if price_t0 is None:
+                price_t0 = _get_cached_daily(sc, trade_date)
             if price_t0:
-                mv_t0 += info['quantity'] * price_t0
+                if isinstance(price_t0, dict):
+                    price_t0 = price_t0.get('close')
+                mv_t0 += info['quantity'] * float(price_t0)
         t0_return = (mv_t0 / total_cost - 1) if total_cost > 0 else None
 
-        # 计算 T1~T5 收益率
+        # T1~T5 收益率（预取数据 + Tushare fallback）
         returns = {}
         for offset in range(1, 6):
             target_d = trade_date
@@ -2123,9 +2641,23 @@ def get_strategy_returns(strategy_id):
                 target_d = get_next_trading_day(target_d, 'next')
             mv = 0.0
             for info in stock_info:
-                price, _ = get_price_from_tushare(info['stock_code'], target_d, 'close', auto_next=True)
-                if price:
-                    mv += info['quantity'] * price
+                sc = info['stock_code']
+                price = None
+                stock_prices = batch_prices.get(sc, {})
+                if target_d in stock_prices:
+                    price = stock_prices[target_d].get('close')
+                if price is None:
+                    # fallback: DB缓存或Tushare
+                    cached = _get_cached_daily(sc, target_d)
+                    if cached:
+                        price = cached.get('close')
+                if price is None:
+                    # 最终fallback: 直接调Tushare
+                    p, _ = get_price_from_tushare(sc, target_d, 'close', auto_next=True)
+                    if p:
+                        price = p
+                if price is not None:
+                    mv += info['quantity'] * float(price)
             returns[f'T{offset}'] = (mv / total_cost - 1) if total_cost > 0 else None
 
         comp_list = [(info['stock_code'], info['quantity']) for info in stock_info]
@@ -2147,7 +2679,150 @@ def get_strategy_returns(strategy_id):
             'turnover': round(turnover * 100, 2)
         })
 
+    _returns_cache[cache_key] = {'result': result, 'ts': _time.time()}
     return jsonify(result)
+
+# ========== 回测 API ==========
+@app.route('/api/strategies/<strategy_id>/backtest', methods=['GET'])
+def run_strategy_backtest(strategy_id):
+    """计算策略信号的历史表现：对每个信号查询 T+N 日后的价格，计算实际收益率"""
+    holding_days = int(request.args.get('holding_days', 1))
+    if holding_days < 1:
+        holding_days = 1
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT stock_code, trade_date, composite_score, technical_score,
+                       rsi_14, volume_ratio, ma_trend, momentum_5d_pct,
+                       filter_result, rejection_reason, components_json
+                FROM signal_technical_analysis
+                WHERE strategy_id = %s
+                ORDER BY trade_date DESC, composite_score DESC
+                LIMIT 200
+            """, (strategy_id,))
+            signals = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not signals:
+        return jsonify({'results': [], 'summary': {'total_signals': 0}})
+
+    results = []
+    passed = 0
+    correct = 0
+    returns_list = []
+
+    for sig in signals:
+        td = sig['trade_date']
+        if isinstance(td, datetime):
+            td = td.date()
+        # 找到 T+N 交易日
+        target_date = td
+        for _ in range(holding_days):
+            target_date = get_next_trading_day(target_date, 'next')
+
+        # 获取当天收盘价和T+N收盘价
+        price_t0 = None
+        price_tn = None
+        try:
+            p0, _ = get_price_from_tushare(sig['stock_code'], td, 'close', auto_next=True)
+            pn, _ = get_price_from_tushare(sig['stock_code'], target_date, 'close', auto_next=True)
+            if p0 and pn:
+                price_t0 = p0
+                price_tn = pn
+        except Exception:
+            pass
+
+        rejected = sig['filter_result'] != 'pass'
+        data_available = price_t0 is not None and price_tn is not None
+        actual_return = None
+        is_correct = None
+
+        if data_available:
+            actual_return = round((price_tn - price_t0) / price_t0 * 100, 2)
+            is_correct = actual_return > 0
+            returns_list.append(actual_return)
+            if not rejected:
+                passed += 1
+                if is_correct:
+                    correct += 1
+
+        results.append({
+            'stock_code': sig['stock_code'],
+            'stock_name': '',
+            'date': td.strftime('%Y-%m-%d'),
+            'actual_return': actual_return,
+            'correct': is_correct,
+            'rsi': float(sig['rsi_14'] or 0),
+            'volume_ratio': float(sig['volume_ratio'] or 0),
+            'ma_trend': sig['ma_trend'] or '',
+            'momentum_5d_pct': float(sig['momentum_5d_pct'] or 0),
+            'technical_score': float(sig['technical_score'] or 0),
+            'composite_score': float(sig['composite_score'] or 0),
+            'rejected': rejected,
+            'rejection_reason': sig['rejection_reason'] or '',
+            'data_available': data_available,
+            'holding_days': holding_days,
+        })
+
+    total = len(results)
+    summary = {
+        'total_signals': total,
+        'data_available': sum(1 for r in results if r['data_available']),
+        'rejected_count': sum(1 for r in results if r['rejected']),
+        'passed_count': passed,
+        'correct_passed': correct,
+        'accuracy': round(correct / passed * 100, 1) if passed > 0 else 0,
+        'avg_return': round(sum(returns_list) / len(returns_list), 2) if returns_list else 0,
+        'max_return': round(max(returns_list), 2) if returns_list else 0,
+        'min_return': round(min(returns_list), 2) if returns_list else 0,
+        'holding_days': holding_days,
+    }
+
+    return jsonify({'results': results, 'summary': summary})
+
+# ========== 信号技术分析调试 API ==========
+@app.route('/api/signals/<strategy_id>/technical/<date_str>', methods=['GET'])
+def get_signal_technical_analysis(strategy_id, date_str):
+    """查看某日信号的技术分析详情"""
+    try:
+        trade_dt = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': '日期格式错误，需 YYYY-MM-DD'}), 400
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT strategy_id, stock_code, trade_date,
+                       raw_sentiment_score, rsi_14, volume_ratio,
+                       ma5, ma20, ma_trend, momentum_5d_pct,
+                       technical_score, composite_score, overheat_penalty,
+                       rejection_reason, filter_result, components_json, created_at
+                FROM signal_technical_analysis
+                WHERE strategy_id = %s AND trade_date = %s
+                ORDER BY composite_score DESC
+            """, (strategy_id, trade_dt))
+            rows = cursor.fetchall()
+            for r in rows:
+                if isinstance(r.get('trade_date'), date):
+                    r['trade_date'] = r['trade_date'].isoformat()
+                if isinstance(r.get('created_at'), datetime):
+                    r['created_at'] = r['created_at'].isoformat()
+                if r.get('components_json'):
+                    import json as _json_mod
+                    try:
+                        r['components'] = _json_mod.loads(r.pop('components_json'))
+                    except Exception:
+                        r['components'] = r.pop('components_json')
+                else:
+                    r.pop('components_json', None)
+            return jsonify({'strategy_id': strategy_id, 'date': date_str, 'signals': rows})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        conn.close()
 
 # ========== 启动初始化 ==========
 # 加载交易日历
