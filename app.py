@@ -465,7 +465,8 @@ def get_index_data_cached(index_code: str, start_date: date, end_date: date, pri
         dates = []
         current = start_date
         while current <= end_date:
-            dates.append(current)
+            if is_trading_day(current):
+                dates.append(current)
             current += timedelta(days=1)
 
         base_price = None
@@ -2033,7 +2034,8 @@ def get_strategy_nav_history(strategy_id):
     dates = []
     current = start_date
     while current <= end_date:
-        dates.append(current)
+        if is_trading_day(current):
+            dates.append(current)
         current += timedelta(days=1)
 
     # 优先从数据库缓存批量获取价格，miss 的再从 Tushare 补
