@@ -810,40 +810,70 @@ def calculate_strategy_cash_and_positions(strategy_id):
         conn.close()
 
 def _batch_latest_prices(stock_codes, price_type='close'):
-    """Batch-fetch latest prices for multiple stocks in a single Tushare call."""
+    """Batch-fetch latest prices — 优先用今日Tushare数据，DB缓存作为fallback"""
     prices = {}
-    # Try DB cache first
+    today_str = date.today().strftime('%Y%m%d')
+    yesterday = date.today() - timedelta(days=1)
+
+    # 先查DB缓存最新日期，判断是否过期
+    cache_max_date = None
     conn = get_db()
     try:
         with conn.cursor() as cursor:
-            placeholders = ','.join(['%s'] * len(stock_codes))
-            cursor.execute(f"""
-                SELECT stock_code, open, close FROM stock_daily_cache
-                WHERE stock_code IN ({placeholders})
-                AND trade_date = (SELECT MAX(trade_date) FROM stock_daily_cache LIMIT 1)
-            """, tuple(stock_codes))
-            for r in cursor.fetchall():
-                prices[r['stock_code']] = float(r[price_type])
+            cursor.execute("SELECT MAX(trade_date) as d FROM stock_daily_cache")
+            row = cursor.fetchone()
+            if row and row['d']:
+                cache_max_date = row['d'].date() if isinstance(row['d'], datetime) else row['d']
     except Exception:
         pass
     finally:
         conn.close()
 
-    missing = [c for c in stock_codes if c not in prices]
-    if missing:
+    # 缓存未过期(<2天)：优先用缓存
+    if cache_max_date and (date.today() - cache_max_date).days < 2:
+        conn = get_db()
         try:
-            df = pro.daily(ts_code=','.join(missing), trade_date=date.today().strftime('%Y%m%d'))
-            if df.empty:
-                df = pro.daily(ts_code=','.join(missing), limit=1)
-            for _, row in df.iterrows():
-                prices[row['ts_code']] = float(row[price_type])
-        except Exception as e:
-            print(f"[NAV] 批量获取价格失败: {e}")
+            with conn.cursor() as cursor:
+                placeholders = ','.join(['%s'] * len(stock_codes))
+                cursor.execute(f"""
+                    SELECT stock_code, open, close FROM stock_daily_cache
+                    WHERE stock_code IN ({placeholders})
+                    AND trade_date = %s
+                """, (*tuple(stock_codes), cache_max_date))
+                for r in cursor.fetchall():
+                    prices[r['stock_code']] = float(r[price_type])
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+        missing = [c for c in stock_codes if c not in prices]
+        if missing:
             for code in missing:
-                if code not in prices:
-                    p = get_latest_price(code, price_type)
-                    if p:
-                        prices[code] = p
+                p = get_latest_price(code, price_type)
+                if p:
+                    prices[code] = p
+        return prices
+
+    # 缓存过期或不存在：直接用Tushare
+    try:
+        ts_codes = ','.join(_ensure_ts_code(c) for c in stock_codes)
+        df = pro.daily(ts_code=ts_codes, trade_date=today_str)
+        if df.empty:
+            yesterday_str = yesterday.strftime('%Y%m%d')
+            df = pro.daily(ts_code=ts_codes, trade_date=yesterday_str)
+        if df.empty:
+            df = pro.daily(ts_code=ts_codes, limit=1)
+        for _, row in df.iterrows():
+            tc = row['ts_code']
+            bare = tc.split('.')[0] if '.' in tc else tc
+            prices[bare] = float(row[price_type])
+    except Exception as e:
+        print(f"[NAV] 批量获取价格失败: {e}")
+        for code in stock_codes:
+            p = get_latest_price(code, price_type)
+            if p:
+                prices[code] = p
     return prices
 
 
