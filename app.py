@@ -830,8 +830,8 @@ def _batch_latest_prices(stock_codes, price_type='close'):
     finally:
         conn.close()
 
-    # 缓存未过期(<2天)：优先用缓存
-    if cache_max_date and (date.today() - cache_max_date).days < 2:
+    # 缓存未过期(<4天，覆盖周末和长假)：优先用缓存
+    if cache_max_date and (date.today() - cache_max_date).days < 4:
         conn = get_db()
         try:
             with conn.cursor() as cursor:
@@ -1490,6 +1490,8 @@ def execute_trade(log_id, strategy_id, stock_code, trade_id, action, quantity,
             cursor.execute(f"UPDATE trade_logs SET {set_clause} WHERE id=%s", values)
         conn.commit()
         print(f"[INFO] 交易成功: {strategy_id} trade_id={trade_id} {action} {quantity}@{actual_price} ({order_type})")
+        # 清理 NAV 缓存，确保下次查询拿到最新净值
+        _invalidate_nav_cache(strategy_id)
     except pymysql.err.IntegrityError as e:
         conn.rollback()
         print(f"[WARN] 唯一约束冲突，交易已存在，忽略本次重复执行: {e}")
@@ -1937,6 +1939,13 @@ def add_strategies():
                           intended_datetime, intended_datetime, order_type, limit_price, cutoff_time))
 
         conn.commit()
+
+        # 同步执行待成交订单，确保前端提交后立即能看到净值曲线
+        process_pending_orders()
+
+        # 清理该策略的 NAV 缓存，确保下次查询拿到最新净值
+        _invalidate_nav_cache(strategy_id)
+
         return jsonify({'message': 'success'}), 200
     except Exception as e:
         conn.rollback()
@@ -1966,8 +1975,131 @@ def list_strategies():
     finally:
         conn.close()
 
+# 策略表现批量查询缓存 — 60s TTL，避免每次总览页加载都重算 16 个策略
+_perf_cache = {'data': None, 'ts': 0}
+
+@app.route('/api/strategies/performance', methods=['GET'])
+def get_strategies_performance():
+    """批量获取所有策略的净值百分比和稳定性，按表现排名"""
+    if _time.time() - _perf_cache['ts'] < 60 and _perf_cache['data'] is not None:
+        return jsonify(_perf_cache['data'])
+
+    from statistics import stdev
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT strategy_id, initial_capital FROM strategies")
+            strategies = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not strategies:
+        return jsonify([])
+
+    # 预取所有持仓的价格，避免每个策略单独调用 Tushare
+    all_codes = set()
+    strategy_positions = {}
+    for s in strategies:
+        sid = s['strategy_id']
+        cash, positions = calculate_strategy_cash_and_positions(sid)
+        if cash is None:
+            continue
+        strategy_positions[sid] = (cash, positions)
+        all_codes.update(positions.keys())
+
+    all_prices = _batch_latest_prices(list(all_codes), 'close') if all_codes else {}
+
+    result = []
+    for s in strategies:
+        sid = s['strategy_id']
+        initial = float(s['initial_capital'])
+
+        if sid not in strategy_positions:
+            continue
+
+        cash, positions = strategy_positions[sid]
+        total_mv = sum(float(qty) * all_prices.get(code, 0) for code, qty in positions.items())
+        nav_data = cash + total_mv
+        nav_percent = round((nav_data / initial) * 100, 2) if initial > 0 else 0
+
+        volatility = None
+        try:
+            nav_history = _compute_nav_history(sid, limit_days=20)
+            if len(nav_history) >= 3:
+                daily_returns = []
+                for i in range(1, len(nav_history)):
+                    prev = nav_history[i - 1]['nav']
+                    curr = nav_history[i]['nav']
+                    if prev and prev > 0:
+                        daily_returns.append((curr - prev) / prev * 100)
+                if len(daily_returns) >= 2:
+                    volatility = round(stdev(daily_returns), 2)
+        except Exception:
+            pass
+
+        result.append({
+            'strategy_id': sid,
+            'nav_percent': nav_percent,
+            'total_nav': round(nav_data, 2),
+            'volatility': volatility,
+        })
+
+    result.sort(key=lambda x: (-x['nav_percent'], x['volatility'] if x['volatility'] is not None else 999))
+
+    _perf_cache['data'] = result
+    _perf_cache['ts'] = _time.time()
+
+    return jsonify(result)
+
+
+def _compute_nav_history(strategy_id, limit_days=20):
+    """计算策略最近 N 个交易日的 NAV 历史（内部辅助，不走 HTTP 缓存）"""
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT initial_capital FROM strategies WHERE strategy_id = %s", (strategy_id,))
+            row = cursor.fetchone()
+            if not row:
+                return []
+            initial_capital = float(row['initial_capital'])
+
+            cursor.execute("""
+                SELECT DISTINCT trade_date FROM trades
+                WHERE strategy_id = %s ORDER BY trade_date DESC LIMIT %s
+            """, (strategy_id, limit_days))
+            dates = [r['trade_date'] for r in cursor.fetchall()]
+            dates.reverse()
+    finally:
+        conn.close()
+
+    result = []
+    for d in dates:
+        nav = get_strategy_nav_at_date(strategy_id, d, price_type='close')
+        if nav is not None:
+            result.append({
+                'date': d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d),
+                'nav': nav,
+                'nav_percent': round((nav / initial_capital) * 100, 2)
+            })
+    return result
+
+
 # NAV 历史缓存 — 历史区间永久缓存，含今天的区间 120s TTL
 _nav_cache = {}
+
+def _invalidate_nav_cache(strategy_id):
+    """清理指定策略的所有 NAV 缓存"""
+    keys_to_clear = [k for k in _nav_cache if k[0] == strategy_id]
+    for k in keys_to_clear:
+        del _nav_cache[k]
+    if keys_to_clear:
+        print(f"[CACHE] 已清理 {strategy_id} 的 NAV 缓存 ({len(keys_to_clear)} 条)")
+    # 同时清理性能总览缓存
+    global _perf_cache
+    if _perf_cache['data'] is not None:
+        _perf_cache['data'] = None
+        _perf_cache['ts'] = 0
 
 @app.route('/api/strategies/<strategy_id>/nav', methods=['GET'])
 def get_strategy_nav_history(strategy_id):
@@ -2873,7 +3005,19 @@ scheduler.add_job(func=sync_daily_performance_to_dynamodb, trigger="cron", hour=
 # 拉模式：每 30 秒轮询 DynamoDB Streams 获取新信号
 if os.environ.get('ENABLE_PULL_MODE', '').lower() == 'true':
     scheduler.add_job(func=poll_dynamodb_signals, trigger="interval", seconds=30)
+
+# 预热性能缓存：每 55 秒刷新一次，确保总览页首次加载也快
+def _warm_perf_cache():
+    try:
+        get_strategies_performance()
+    except Exception:
+        pass
+scheduler.add_job(func=_warm_perf_cache, trigger="interval", seconds=55)
 scheduler.start()
+
+# 启动后立即异步预热性能缓存（不阻塞服务启动）
+import threading
+threading.Thread(target=_warm_perf_cache, daemon=True).start()
 atexit.register(lambda: scheduler.shutdown())
 
 if __name__ == '__main__':
