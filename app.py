@@ -2528,8 +2528,10 @@ def get_strategy_holdings_at_date(strategy_id):
             buy_date_val = batch['buy_date'].date() if isinstance(batch['buy_date'], datetime) else batch['buy_date']
             holding_days = count_trading_days(buy_date_val, display_date)
             batches_detail.append([batch['quantity'], holding_days])
+        stock_name = get_stock_name(stock_code) or stock_code
         holdings_list.append({
             'stock_code': stock_code,
+            'stock_name': stock_name,
             'quantity': qty,
             'open_price': price_open if price_open else None,
             'close_price': price_close if price_close else None,
@@ -2915,7 +2917,7 @@ def run_strategy_backtest(strategy_id):
 
         results.append({
             'stock_code': sig['stock_code'],
-            'stock_name': '',
+            'stock_name': get_stock_name(sig['stock_code']) or sig['stock_code'],
             'date': td.strftime('%Y-%m-%d'),
             'actual_return': actual_return,
             'correct': is_correct,
